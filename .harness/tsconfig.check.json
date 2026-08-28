@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2023",
+    "lib": ["es2023", "dom"],
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "paths": {
+      "@earendil-works/pi-coding-agent": [
+        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-coding-agent@0.84.3_ws@8.21.3_zod@4.4.3/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+      ],
+      "@earendil-works/pi-ai": [
+        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-ai@0.84.3_ws@8.21.3/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
+      ],
+      "@earendil-works/pi-ai/compat": [
+        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-ai@0.84.3_ws@8.21.3/node_modules/@earendil-works/pi-ai/dist/compat.d.ts"
+      ],
+      "@earendil-works/pi-tui": [
+        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-tui@0.84.3/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
+      ]
+    }
+  },
+  "include": ["../index.ts", "../config.ts", "../state.ts", "../naming.ts", "../ui-config.ts"]
+}

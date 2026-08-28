@@ -1,0 +1,9 @@
+{
+  "name": "@earendil-works/pi-ai",
+  "version": "0.84.3",
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./compat": "./compat.mjs"
+  }
+}

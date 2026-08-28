@@ -1,0 +1,10 @@
+# Dependencies (harness shims)
+node_modules/
+
+# Trellis workspace — internal AI-workflow tooling, not part of the
+# open-source package. The files stay on disk locally.
+.trellis/
+.agents/
+.pi/
+AGENTS.md
+.gitattributes

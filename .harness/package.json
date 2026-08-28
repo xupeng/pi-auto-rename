@@ -1,0 +1,6 @@
+{
+  "name": "pi-auto-rename-harness",
+  "private": true,
+  "type": "module",
+  "description": "Offline verification harness for pi-auto-rename (faux provider + controllable clock)"
+}

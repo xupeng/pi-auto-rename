@@ -1,0 +1,33 @@
+{
+  "name": "pi-auto-rename",
+  "version": "0.1.0",
+  "description": "Modern pi session auto-rename: automatic short titles after the first messages, optional continuous topic tracking, and a hard rule that manual names are never overwritten",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "session",
+    "rename"
+  ],
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "config.ts",
+    "state.ts",
+    "naming.ts",
+    "ui-config.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

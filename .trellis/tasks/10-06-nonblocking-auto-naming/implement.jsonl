@@ -1,0 +1,6 @@
+{"file":".trellis/spec/pi-extensions/index.md","reason":"Pi extension scope and registry-based model-call conventions"}
+{"file":".trellis/spec/pi-extensions/extension-api.md","reason":"Naming/manual-state/event/cancellation contracts and existing regression obligations"}
+{"file":".trellis/spec/guides/index.md","reason":"Shared change-boundary and verification guidance"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Keep request ownership and cancellation helpers narrowly scoped without duplicate lifecycle logic"}
+{"file":".trellis/tasks/10-06-nonblocking-auto-naming/research/runtime-lifecycle.md","reason":"Verified awaiting order, context invalidation, tree lifecycle, cancellation pitfalls, and deterministic E2E design"}
+{"file":".trellis/tasks/10-06-nonblocking-auto-naming/research/minimum-api-compatibility.md","reason":"Official v0.84.0 API evidence and limits of minimum-version runtime verification"}

@@ -1,0 +1,5 @@
+{"file":".trellis/spec/pi-extensions/index.md","reason":"Check applicable extension scope and registry requirements"}
+{"file":".trellis/spec/pi-extensions/extension-api.md","reason":"Verify naming/manual-state compatibility, cooldown, single-flight, and error contracts"}
+{"file":".trellis/spec/guides/index.md","reason":"Review actual source evidence and avoid tautological nonblocking tests"}
+{"file":".trellis/tasks/archive/2026-10/10-06-nonblocking-auto-naming/research/runtime-lifecycle.md","reason":"Review stale-owner protection, independent deadline, branch transitions, and actual Agent progress evidence"}
+{"file":".trellis/tasks/archive/2026-10/10-06-nonblocking-auto-naming/research/minimum-api-compatibility.md","reason":"Distinguish minimum API source verification from current runtime execution coverage"}

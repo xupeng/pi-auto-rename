@@ -3,15 +3,19 @@
  *
  * Resolves the naming model (config override, or the session's current model),
  * builds system/user prompts for the three naming kinds (first / history /
- * update), calls the AI via @earendil-works/pi-ai/compat (complete), and
- * sanitizes the raw output into a short title. All failures are returned as
- * { error } — never thrown.
+ * update), calls the AI through ctx.modelRegistry.complete(), and sanitizes the
+ * raw output into a short title. All failures are returned as { error } — never
+ * thrown.
  *
- * The @earendil-works/pi-ai/compat import is the single coupling point to the
- * pi-ai version: complete() moved to the /compat subpath in pi-ai 0.84.
+ * Why the registry and not @earendil-works/pi-ai/compat: compat's complete()
+ * dispatches on pi-ai's global api registry, which only knows builtin api ids.
+ * A provider registered by another extension (`registerProvider({ api,
+ * streamSimple })`, e.g. cliproxyapi's "cliproxyapi-codex-responses") has no
+ * entry there, so compat throws `No API provider registered for api: ...`.
+ * ctx.modelRegistry.complete() resolves auth and routes through the provider pi
+ * composed, so extension-provided api ids behave like builtin ones.
  */
 
-import { complete } from "@earendil-works/pi-ai/compat";
 import type { Api, Model, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RenameConfig } from "./config.ts";
@@ -25,13 +29,24 @@ export const NAMING_TIMEOUT_MS = 30 * 1000;
 export interface NamingOptions {
 	/** Current session title — required for kind === "update". */
 	currentName?: string;
-	/** Abort signal forwarded to the provider request. */
+	/**
+	 * Explicit cancellation source for the request. Replaces ctx.signal: automatic
+	 * callers pass a session-owned signal instead of inheriting the signal of an
+	 * unrelated primary agent run.
+	 */
 	signal?: AbortSignal;
 }
 
 export interface NamingResult {
 	name?: string;
 	error?: string;
+	/**
+	 * Why the request ended without a provider outcome: the independent deadline
+	 * fired ("timeout") or the caller's signal aborted ("cancelled"). Automatic
+	 * callers treat "cancelled" as supersession (silent, no failure cooldown) and
+	 * "timeout" as a normal failure.
+	 */
+	reason?: "timeout" | "cancelled";
 }
 
 /** Resolve the model to use for naming. */
@@ -48,25 +63,6 @@ export function resolveModel(ctx: ExtensionContext, config: RenameConfig): { mod
 		return { error: "No active session model available for naming" };
 	}
 	return { model: ctx.model };
-}
-
-export interface ResolvedAuth {
-	ok: boolean;
-	apiKey?: string;
-	headers?: Record<string, string | null>;
-	error?: string;
-}
-
-/** Resolve API key + headers for the naming model. */
-export async function getAuth(ctx: ExtensionContext, model: Model<Api>): Promise<ResolvedAuth> {
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok) {
-		return { ok: false, error: auth.error };
-	}
-	if (!auth.apiKey) {
-		return { ok: false, error: `No API key configured for ${model.provider}. Use /login or models.json.` };
-	}
-	return { ok: true, apiKey: auth.apiKey, headers: auth.headers };
 }
 
 function buildStyleLine(config: RenameConfig): string {
@@ -162,55 +158,118 @@ export async function generateName(
 	input: string,
 	options?: NamingOptions,
 ): Promise<NamingResult> {
-	const externalSignal = options?.signal ?? ctx.signal;
-	let controller: AbortController | undefined;
-	let timeout: ReturnType<typeof setTimeout> | undefined;
-	let signal = externalSignal;
-	if (!signal) {
-		// No abort source available: own the cancellation so a hung request
-		// cannot wedge the single-flight guard (inFlight) forever.
-		controller = new AbortController();
-		timeout = setTimeout(() => controller?.abort(), NAMING_TIMEOUT_MS);
-		signal = controller.signal;
-	}
+	// Every request owns a request-specific controller and an independent 30s
+	// deadline, whether or not an upstream signal exists: a provider that ignores
+	// abort must not be able to keep the extension's request pending forever.
+	// The controller is only used to cancel this title request — never ctx.abort()
+	// or the primary agent's controller.
+	const controller = new AbortController();
+	let timedOut = false;
+	const cleanups: Array<() => void> = [];
+
+	const localOutcome = (): NamingResult =>
+		timedOut
+			? { error: `Naming request timed out after ${NAMING_TIMEOUT_MS}ms`, reason: "timeout" }
+			: { error: "Naming request cancelled", reason: "cancelled" };
+
 	try {
-		const resolved = resolveModel(ctx, config);
-		if (!resolved.model) return { error: resolved.error ?? "No naming model available" };
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, NAMING_TIMEOUT_MS);
+		cleanups.push(() => clearTimeout(timeout));
 
-		const auth = await getAuth(ctx, resolved.model);
-		if (!auth.ok) return { error: auth.error ?? "No API key available for the naming model" };
-
-		const systemPrompt = buildSystemPrompt(config);
-		const userMessage = buildUserPrompt(kind, input, options?.currentName);
-
-		const response = await complete(
-			resolved.model,
-			{ systemPrompt, messages: [userMessage] },
-			{
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				maxTokens: NAMING_MAX_TOKENS,
-				signal,
-			},
-		);
-
-		if (response.stopReason === "error" || response.stopReason === "aborted") {
-			return { error: response.errorMessage ?? `Naming request failed (${response.stopReason})` };
+		// ctx.signal is a context getter that can throw once the context has been
+		// invalidated; capture it defensively so generateName keeps its
+		// "never throws" contract (an explicit options.signal is always safe).
+		let externalSignal: AbortSignal | undefined;
+		try {
+			externalSignal = options?.signal ?? ctx.signal;
+		} catch {
+			externalSignal = options?.signal;
 		}
 
-		const raw = response.content
-			.filter((block): block is { type: "text"; text: string } => block.type === "text")
-			.map((block) => block.text)
-			.join("\n");
-
-		const name = sanitizeName(raw);
-		if (!name) {
-			return { error: "Naming model returned an empty title" };
+		const onExternalAbort = (): void => {
+			controller.abort();
+		};
+		if (externalSignal) {
+			if (externalSignal.aborted) {
+				onExternalAbort();
+			} else {
+				const signal = externalSignal;
+				signal.addEventListener("abort", onExternalAbort, { once: true });
+				cleanups.push(() => signal.removeEventListener("abort", onExternalAbort));
+			}
 		}
-		return { name };
+
+		// Pre-aborted upstream signal: settle locally without dispatching.
+		if (controller.signal.aborted) return localOutcome();
+
+		// Registered before the provider call so the local deadline/cancellation
+		// outcome wins the race even when the provider also reacts to the abort.
+		// The listener is named and removed in finally: we never assume the
+		// provider drops its retained AbortSignal reference.
+		let resolveLocal: (result: NamingResult) => void = () => {};
+		const localCancellation = new Promise<NamingResult>((resolve) => {
+			resolveLocal = resolve;
+		});
+		const onLocalAbort = (): void => {
+			resolveLocal(localOutcome());
+		};
+		controller.signal.addEventListener("abort", onLocalAbort, { once: true });
+		cleanups.push(() => controller.signal.removeEventListener("abort", onLocalAbort));
+
+		// The provider work always settles (never rejects): a late rejection after
+		// cancellation is consumed here and ignored.
+		const providerWork = (async (): Promise<NamingResult> => {
+			try {
+				const resolved = resolveModel(ctx, config);
+				if (!resolved.model) return { error: resolved.error ?? "No naming model available" };
+
+				const systemPrompt = buildSystemPrompt(config);
+				const userMessage = buildUserPrompt(kind, input, options?.currentName);
+
+				// Registry call: resolves apiKey/headers/baseUrl, then streams through the
+				// effective provider (including extension-registered api ids). Auth and
+				// provider failures throw here and become { error } below.
+				const response = await ctx.modelRegistry.complete(
+					resolved.model,
+					{ systemPrompt, messages: [userMessage] },
+					{ maxTokens: NAMING_MAX_TOKENS, signal: controller.signal },
+				);
+
+				if (response.stopReason === "error" || response.stopReason === "aborted") {
+					return { error: response.errorMessage ?? `Naming request failed (${response.stopReason})` };
+				}
+
+				const raw = response.content
+					.filter((block): block is { type: "text"; text: string } => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+
+				const name = sanitizeName(raw);
+				if (!name) {
+					return { error: "Naming model returned an empty title" };
+				}
+				return { name };
+			} catch (error) {
+				return { error: error instanceof Error ? error.message : String(error) };
+			}
+		})();
+
+		return await Promise.race([providerWork, localCancellation]);
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };
 	} finally {
-		if (timeout !== undefined) clearTimeout(timeout);
+		// Timer and every listener this request owns are removed on all exit
+		// paths: success, provider/auth failure, deadline, cancellation, and
+		// pre-aborted input.
+		for (const cleanup of cleanups.splice(0)) {
+			try {
+				cleanup();
+			} catch {
+				// Cleanup must stay total.
+			}
+		}
 	}
 }

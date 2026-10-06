@@ -16,6 +16,14 @@
  *   External renames are detected in session_info_changed by comparing the
  *   event name with the name this extension last set.
  *
+ * Automatic naming never blocks the agent. Lifecycle handlers reserve a
+ * session-owned request synchronously and return; the provider call is deferred
+ * and raced against an independent 30s deadline. Every success, error,
+ * notification, cooldown update, and finalizer re-checks request ownership, so a
+ * late result cannot mutate a replaced session/branch or release a newer
+ * request. Session shutdown, branch navigation, manual renames, and disabling
+ * automatic naming all invalidate the affected pending request.
+ *
  * Commands:
  * - /rename [name]            set directly (manual) or generate from history
  * - /rename-config <sub>      model | style | auto | continuous | language
@@ -72,6 +80,30 @@ interface PerSessionState {
 	lastFailTime: number;
 }
 
+type AutomaticNamingKind = "first" | "continuous";
+type RequestKind = AutomaticNamingKind | "manual";
+
+/**
+ * A naming request that owns the single-flight guard. An automatic request is
+ * created synchronously by a lifecycle handler and deferred; an explicit
+ * /rename (AI) request is created by the command and awaited. Either way a
+ * lifecycle/session transition, a manual rename, or a newer request can
+ * invalidate it before or while it runs.
+ */
+interface PendingRequest {
+	kind: RequestKind;
+	/** Session/branch generation captured when the request was reserved. */
+	generation: number;
+	/** Name/manual revision captured when the request was reserved. */
+	nameEpoch: number;
+	/** Request-owned cancellation source (never the primary agent's controller). */
+	controller: AbortController;
+	/** Set once a newer owner or a lifecycle transition supersedes this request. */
+	invalidated: boolean;
+	/** For continuous requests: the title the update was compared against. */
+	baseName?: string;
+}
+
 type CompletionItem = { value: string; label: string };
 
 interface MessageText {
@@ -95,12 +127,136 @@ export default function autoRename(pi: ExtensionAPI): void {
 	/** provider/id refs for /rename-config model completions (refreshed per session). */
 	let modelRefs: string[] = [];
 
+	/** Request (automatic or explicit) currently holding the single-flight guard. */
+	let activeRequest: PendingRequest | null = null;
+	/** Bumped on every session replacement and successful branch navigation. */
+	let branchGeneration = 0;
+	/** Bumped on every name/manual revision change (rename, clear, external rename). */
+	let nameEpoch = 0;
+
 	function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
-		ctx.ui.notify(message, level);
+		try {
+			ctx.ui.notify(message, level);
+		} catch {
+			// A context can be invalidated between an async boundary and a
+			// background notification; a stale notification must not reject.
+		}
 	}
 
 	function errMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
+	}
+
+	function readSessionId(ctx: ExtensionContext): string | undefined {
+		try {
+			return ctx.sessionManager.getSessionId();
+		} catch {
+			// The session manager is invalidated after a session replacement.
+			return undefined;
+		}
+	}
+
+	// ---------- background request ownership ----------
+
+	/**
+	 * Release an automatic or manual request. Mark the owner stale and abort its
+	 * owned controller; provider cooperation is not required for local release.
+	 * A late resolution/rejection can then no longer mutate
+	 * the session, notify, update the failure cooldown, or release a newer
+	 * request's single-flight guard.
+	 */
+	function releaseRequest(request: PendingRequest): void {
+		request.invalidated = true;
+		if (activeRequest === request) {
+			activeRequest = null;
+			state.inFlight = false;
+		}
+		try {
+			request.controller.abort();
+		} catch {
+			// AbortController.abort() does not throw; keep shutdown paths total.
+		}
+	}
+
+	function invalidateActiveRequest(kind?: RequestKind): void {
+		const request = activeRequest;
+		if (!request) return;
+		if (kind && request.kind !== kind) return;
+		releaseRequest(request);
+	}
+
+	/**
+	 * Invalidate a pending automatic request without touching an explicit
+	 * /rename (AI) request, which must survive config changes.
+	 */
+	function invalidateAutomaticRequest(kind?: AutomaticNamingKind): void {
+		const request = activeRequest;
+		if (!request || request.kind === "manual") return;
+		if (kind && request.kind !== kind) return;
+		releaseRequest(request);
+	}
+
+	/** True while this request still owns the session/branch/name it was launched on. */
+	function isCurrentRequest(request: PendingRequest): boolean {
+		return (
+			!request.invalidated &&
+			activeRequest === request &&
+			request.generation === branchGeneration &&
+			request.nameEpoch === nameEpoch
+		);
+	}
+
+	/** True while this request still owns the single-flight guard (release check). */
+	function ownsGuard(request: PendingRequest): boolean {
+		return activeRequest === request;
+	}
+
+	/** Reserve the single-flight guard synchronously, before deferring the call. */
+	function reserveAutomaticRequest(kind: AutomaticNamingKind, baseName?: string): PendingRequest | null {
+		if (!config.autoRename || state.manual || state.inFlight) return null;
+		const request: PendingRequest = {
+			kind,
+			generation: branchGeneration,
+			nameEpoch,
+			controller: new AbortController(),
+			invalidated: false,
+			baseName,
+		};
+		activeRequest = request;
+		state.inFlight = true;
+		return request;
+	}
+
+	/**
+	 * Reserve an explicit /rename (AI) request. It supersedes any pending
+	 * automatic or earlier manual request and suspends automatic scheduling
+	 * (state.inFlight) until the command settles.
+	 */
+	function reserveManualRequest(): PendingRequest {
+		invalidateActiveRequest();
+		const request: PendingRequest = {
+			kind: "manual",
+			generation: branchGeneration,
+			nameEpoch,
+			controller: new AbortController(),
+			invalidated: false,
+		};
+		activeRequest = request;
+		state.inFlight = true;
+		return request;
+	}
+
+	/**
+	 * Re-check the automatic mode after any config change and invalidate work it
+	 * no longer covers: auto-off cancels automatic work, continuous-off cancels
+	 * only a continuous request. An explicit /rename (AI) is not affected.
+	 */
+	function enforceModeInvalidation(): void {
+		if (!config.autoRename) {
+			invalidateAutomaticRequest();
+			return;
+		}
+		if (!config.continuousRename) invalidateAutomaticRequest("continuous");
 	}
 
 	function persistState(source: RenameSource, name: string): void {
@@ -108,6 +264,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 	}
 
 	function persistConfig(ctx: ExtensionContext, summary: string): void {
+		enforceModeInvalidation();
 		if (saveConfig(config)) {
 			notify(ctx, summary, "info");
 		} else {
@@ -210,6 +367,9 @@ export default function autoRename(pi: ExtensionAPI): void {
 	}
 
 	function applyManualName(ctx: ExtensionContext, name: string): void {
+		// A manual name supersedes any pending automatic title.
+		invalidateActiveRequest();
+		nameEpoch++;
 		state.manual = true;
 		state.lastSetName = name;
 		state.lastAutoName = name;
@@ -220,7 +380,12 @@ export default function autoRename(pi: ExtensionAPI): void {
 
 	// ---------- automatic naming attempts ----------
 
-	async function attemptFirstNaming(ctx: ExtensionContext): Promise<void> {
+	/**
+	 * Schedule a first-naming request without blocking the caller. Eligibility is
+	 * checked and the single-flight guard reserved synchronously; the provider
+	 * call is deferred to a microtask so the lifecycle handler returns first.
+	 */
+	function scheduleFirstNaming(ctx: ExtensionContext): void {
 		if (!config.autoRename || state.manual || state.inFlight) return;
 		if (Date.now() - state.lastFailTime < FIRST_NAMING_RETRY_MS) return;
 		if (pi.getSessionName()) return;
@@ -229,23 +394,54 @@ export default function autoRename(pi: ExtensionAPI): void {
 		const input = firstMessages(ctx.sessionManager.getBranch());
 		if (!input) return;
 
-		state.inFlight = true;
+		// Capture configuration and input before a context replacement can occur.
+		const configSnapshot: RenameConfig = { ...config };
+		const request = reserveAutomaticRequest("first");
+		if (!request) return;
+		queueMicrotask(() => {
+			void runFirstNaming(ctx, request, input, configSnapshot);
+		});
+	}
+
+	async function runFirstNaming(
+		ctx: ExtensionContext,
+		request: PendingRequest,
+		input: string,
+		configSnapshot: RenameConfig,
+	): Promise<void> {
 		try {
-			const result = await generateName(ctx, config, "first", input);
+			if (!isCurrentRequest(request)) return;
+			if (!config.autoRename) return;
+
+			const result = await generateName(ctx, configSnapshot, "first", input, {
+				signal: request.controller.signal,
+			});
+			if (!isCurrentRequest(request)) return;
+			if (result.reason === "cancelled") return;
 			if (result.error) {
 				state.lastFailTime = Date.now();
 				notify(ctx, `Auto rename skipped: ${result.error}`, "warning");
 				return;
 			}
-			if (result.name && !pi.getSessionName()) {
+			if (result.name && !state.manual && !pi.getSessionName()) {
 				applyAutoName(ctx, result.name);
 			}
+		} catch (error) {
+			if (isCurrentRequest(request)) {
+				notify(ctx, `Auto rename failed: ${errMessage(error)}`, "warning");
+			}
 		} finally {
-			state.inFlight = false;
+			// Only the owner may release the guard: an old request's finally must
+			// not clear a newer request's bookkeeping.
+			if (ownsGuard(request)) {
+				activeRequest = null;
+				state.inFlight = false;
+			}
 		}
 	}
 
-	async function evaluateContinuous(ctx: ExtensionContext): Promise<void> {
+	/** Schedule a continuous re-evaluation without blocking the settle handler. */
+	function scheduleContinuous(ctx: ExtensionContext): void {
 		if (!config.autoRename || !config.continuousRename) return;
 		if (state.manual || state.inFlight) return;
 		if (state.lastAutoTime === 0) return;
@@ -262,9 +458,32 @@ export default function autoRename(pi: ExtensionAPI): void {
 		const input = recentMessages(ctx.sessionManager.getBranch());
 		if (!input) return;
 
-		state.inFlight = true;
+		const configSnapshot: RenameConfig = { ...config };
+		const request = reserveAutomaticRequest("continuous", currentName);
+		if (!request) return;
+		queueMicrotask(() => {
+			void runContinuous(ctx, request, input, configSnapshot);
+		});
+	}
+
+	async function runContinuous(
+		ctx: ExtensionContext,
+		request: PendingRequest,
+		input: string,
+		configSnapshot: RenameConfig,
+	): Promise<void> {
+		const currentName = request.baseName;
 		try {
-			const result = await generateName(ctx, config, "update", input, { currentName });
+			if (!isCurrentRequest(request)) return;
+			if (!config.autoRename || !config.continuousRename || state.manual) return;
+			if (currentName === undefined) return;
+
+			const result = await generateName(ctx, configSnapshot, "update", input, {
+				signal: request.controller.signal,
+				currentName,
+			});
+			if (!isCurrentRequest(request)) return;
+			if (result.reason === "cancelled") return;
 			if (result.error) {
 				notify(ctx, `Continuous rename skipped: ${result.error}`, "warning");
 				return;
@@ -275,9 +494,19 @@ export default function autoRename(pi: ExtensionAPI): void {
 			// (marking it manual) while the naming request was in flight.
 			if (state.manual) return;
 			if (pi.getSessionName() !== currentName) return;
+			if (!config.autoRename || !config.continuousRename) return;
 			applyAutoName(ctx, name, "renamed");
+		} catch (error) {
+			if (isCurrentRequest(request)) {
+				notify(ctx, `Continuous rename failed: ${errMessage(error)}`, "warning");
+			}
 		} finally {
-			state.inFlight = false;
+			// Only the owner may release the guard: an old request's finally must
+			// not clear a newer request's bookkeeping.
+			if (ownsGuard(request)) {
+				activeRequest = null;
+				state.inFlight = false;
+			}
 		}
 	}
 
@@ -285,6 +514,11 @@ export default function autoRename(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		try {
+			// A new session lifecycle supersedes work bound to the old session or
+			// branch before state is rebuilt.
+			invalidateActiveRequest();
+			branchGeneration++;
+			nameEpoch++;
 			const branch = ctx.sessionManager.getBranch();
 			const saved = readState(branch);
 
@@ -319,7 +553,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 			// Name sessions that already have messages but no name (e.g. an
 			// older session resumed for the first time). New sessions are
 			// empty here, so this is a no-op for them.
-			await attemptFirstNaming(ctx);
+			scheduleFirstNaming(ctx);
 		} catch (error) {
 			notify(ctx, `Auto rename init failed: ${errMessage(error)}`, "warning");
 		}
@@ -330,7 +564,10 @@ export default function autoRename(pi: ExtensionAPI): void {
 			// Our own setSessionName() call — keep the recorded state.
 			if (event.name === state.lastSetName) return;
 
-			// External rename (e.g. /name or another extension): mark manual.
+			// External rename (e.g. /name or another extension): supersede any
+			// pending automatic title, then mark manual.
+			invalidateActiveRequest();
+			nameEpoch++;
 			state.manual = true;
 			state.lastSetName = event.name ?? null;
 			if (event.name) state.lastAutoName = event.name;
@@ -340,9 +577,42 @@ export default function autoRename(pi: ExtensionAPI): void {
 		}
 	});
 
+	pi.on("session_shutdown", async () => {
+		try {
+			// Quit, reload, or session replacement: cancel scheduled/running work
+			// without awaiting the provider.
+			invalidateActiveRequest();
+			branchGeneration++;
+		} catch (error) {
+			console.error(`[pi-auto-rename] session_shutdown handler failed: ${errMessage(error)}`);
+		}
+	});
+
+	pi.on("session_before_tree", async () => {
+		try {
+			// Conservative: cancel branch-bound work before navigation, even if
+			// another extension cancels the navigation (later triggers can retry).
+			invalidateActiveRequest();
+		} catch (error) {
+			console.error(`[pi-auto-rename] session_before_tree handler failed: ${errMessage(error)}`);
+		}
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		try {
+			// Successful navigation advanced the branch: invalidate stale work and
+			// refresh branch-dependent counts.
+			invalidateActiveRequest();
+			branchGeneration++;
+			state.lastAutoCount = nonEmptyMessages(ctx.sessionManager.getBranch()).length;
+		} catch (error) {
+			console.error(`[pi-auto-rename] session_tree handler failed: ${errMessage(error)}`);
+		}
+	});
+
 	pi.on("message_end", async (_event, ctx) => {
 		try {
-			await attemptFirstNaming(ctx);
+			scheduleFirstNaming(ctx);
 		} catch (error) {
 			notify(ctx, `Auto rename failed: ${errMessage(error)}`, "warning");
 		}
@@ -350,7 +620,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		try {
-			await evaluateContinuous(ctx);
+			scheduleContinuous(ctx);
 		} catch (error) {
 			notify(ctx, `Continuous rename failed: ${errMessage(error)}`, "warning");
 		}
@@ -362,6 +632,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		description:
 			"Name the session: /rename <name> sets it directly; /rename (no args) generates a title from the full history",
 		handler: async (args, ctx) => {
+			let request: PendingRequest | null = null;
 			try {
 				const trimmed = args.trim();
 				if (trimmed) {
@@ -375,7 +646,20 @@ export default function autoRename(pi: ExtensionAPI): void {
 					return;
 				}
 
-				const result = await generateName(ctx, config, "history", history);
+				// Supersede pending automatic/earlier manual work and suspend
+				// automatic scheduling until this explicit request settles.
+				request = reserveManualRequest();
+				const sessionId = readSessionId(ctx);
+
+				const result = await generateName(ctx, config, "history", history, {
+					signal: request.controller.signal,
+				});
+				// Apply only while the captured session/branch/name revision still
+				// belongs to this command: an explicit clear (undefined === undefined)
+				// or an ABA rename must not be overwritten by a stale result.
+				if (!isCurrentRequest(request)) return;
+				if (readSessionId(ctx) !== sessionId) return;
+				if (result.reason === "cancelled") return;
 				if (result.error) {
 					notify(ctx, `Failed to name session: ${result.error}`, "error");
 					return;
@@ -383,6 +667,13 @@ export default function autoRename(pi: ExtensionAPI): void {
 				if (result.name) applyManualName(ctx, result.name);
 			} catch (error) {
 				notify(ctx, `Failed to rename session: ${errMessage(error)}`, "error");
+			} finally {
+				// Failure restores automatic eligibility; success already released the
+				// guard via applyManualName. Only the owner releases it.
+				if (request && ownsGuard(request)) {
+					activeRequest = null;
+					state.inFlight = false;
+				}
 			}
 		},
 	});
@@ -500,6 +791,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 					collectModelRefs: () => collectModelRefs(ctx),
 					resetConfig: () => {
 						config = defaultConfig();
+						enforceModeInvalidation();
 						return resetConfigFile();
 					},
 					notify: (message, level) => notify(ctx, message, level),

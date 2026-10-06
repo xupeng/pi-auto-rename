@@ -4,17 +4,33 @@
  * - Faux provider registry + controllable API-key policy (no real network).
  * - Controllable clock (Date.now patched) and fake timers (setTimeout captured)
  *   so the 5-min thresholds and the 30s naming timeout are fully deterministic.
- * - Mock `complete` via the @earendil-works/pi-ai/compat shim in
- *   .harness/shim/pi-ai (resolved through node_modules symlink at repo root).
+ * - Mock `ctx.modelRegistry.complete` in the mock ctx (the naming call's only
+ *   entry point: it mirrors the runtime — resolve auth, then dispatch). The
+ *   @earendil-works/pi-ai/compat shim now throws, so any fallback to compat
+ *   fails the suite instead of silently passing.
  *
  * Setup (once): bash .harness/setup.sh  (creates node_modules shims)
- * Run: HOME=/tmp/pi-arn-test-home node .harness/run-tests.mjs
+ * Run inside an isolated temp home, never the real HOME:
+ *   ~/.pi/agent/bin/pi-tmp-run --keep-on-failure auto-rename-offline -- \
+ *     bash -c 'export HOME="$(mktemp -d "$PI_TASK_TMPDIR/home.XXXXXX")"; node .harness/run-tests.mjs'
+ * Real-runtime E2E (needs `pi` on PATH, or set PI_BIN):
+ *   ~/.pi/agent/bin/pi-tmp-run --keep-on-failure auto-rename-registry -- \
+ *     bash .harness/e2e-registry-naming.sh
  * Typecheck: cd .harness && npx --yes -p typescript@5.9.2 tsc -p tsconfig.check.json
  */
 import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { setImmediate as _setImmediate } from "node:timers";
+import { getEventListeners } from "node:events";
+
+// ---------------- global failure containment ----------------
+// A late provider rejection after cancellation must be consumed by the request
+// owner. Any unhandled rejection fails the suite instead of surfacing later.
+const unhandledRejections = [];
+process.on("unhandledRejection", (reason) => {
+  unhandledRejections.push(reason);
+});
 
 // ---------------- controllable clock ----------------
 const clock = { now: 1_700_000_000_000 };
@@ -48,8 +64,8 @@ function pendingTimerCount() {
   return timerQueue.length;
 }
 
-// ---------------- complete() controller (used by the shim) ----------------
-globalThis.__ARN__ = { completeCalls: [] };
+// ---------------- complete() controller (used by the mock model registry) ----------------
+globalThis.__ARN__ = { completeCalls: [], compatCalls: [] };
 
 function setComplete(behavior) {
   globalThis.__ARN__.complete = behavior;
@@ -78,6 +94,24 @@ function deferredComplete() {
   return { fn, d };
 }
 
+/**
+ * A complete() that never settles and ignores the abort signal entirely.
+ * Models a provider that does not cooperate with cancellation.
+ */
+function abortResistantComplete() {
+  const d = { resolve: null, promise: null };
+  d.promise = new Promise((res) => {
+    d.resolve = res;
+  });
+  const fn = () => d.promise;
+  return { fn, d };
+}
+
+/** A complete() that never settles and never rejects. */
+function neverComplete() {
+  return () => new Promise(() => {});
+}
+
 // ---------------- faux provider registry ----------------
 const MODELS = {
   faux: {
@@ -87,15 +121,27 @@ const MODELS = {
   nokey: {
     "model-b": { provider: "nokey", id: "model-b", label: "NoKey B" },
   },
+  // Reproduces the real cliproxyapi case: the api id is registered by a provider
+  // extension, so it exists only in pi's composed provider — never in the global
+  // api registry that @earendil-works/pi-ai/compat dispatches on.
+  cliproxy: {
+    "codex-model": {
+      provider: "cliproxy",
+      id: "codex-model",
+      api: "cliproxyapi-codex-responses",
+    },
+  },
 };
 let KEY_POLICY = {
   faux: { ok: true, apiKey: "test-key", headers: { "X-Test": "1" } },
   nokey: { ok: false, error: "no api key configured" },
+  cliproxy: { ok: true, apiKey: "cpa-key", headers: {} },
 };
 function resetKeyPolicy() {
   KEY_POLICY = {
     faux: { ok: true, apiKey: "test-key", headers: { "X-Test": "1" } },
     nokey: { ok: false, error: "no api key configured" },
+    cliproxy: { ok: true, apiKey: "cpa-key", headers: {} },
   };
 }
 
@@ -150,12 +196,25 @@ function makeCtx(pi) {
       getAvailable: () => Object.values(MODELS).flatMap((m) => Object.values(m)),
       getApiKeyAndHeaders: async (model) =>
         KEY_POLICY[model.provider] ?? { ok: true, apiKey: "default-key", headers: {} },
+      // Stands in for ModelRegistry.complete -> ModelRuntime.prepareRequest:
+      // auth is resolved first (throwing like the runtime when unconfigured),
+      // then the call is recorded and dispatched to the harness behavior.
+      complete: async (model, context, options) => {
+        const policy = KEY_POLICY[model.provider] ?? { ok: true, apiKey: "default-key", headers: {} };
+        if (!policy.ok) throw new Error(`Provider is not configured: ${model.provider}`);
+        globalThis.__ARN__.completeCalls.push({ model, context, options });
+        return globalThis.__ARN__.complete(model, context, options);
+      },
     },
     ui: {
       notify: (message, level) => pi.notifications.push({ message, level }),
       select: async () => opts.selectResult ?? null,
     },
-    sessionManager: { getBranch: () => pi.entries },
+    sessionManager: {
+      getBranch: () => pi.entries,
+      getSessionId: () => opts.sessionId ?? "sess-1",
+      getLeafId: () => (pi.entries.length ? pi.entries[pi.entries.length - 1].id : null),
+    },
   };
 }
 
@@ -175,6 +234,13 @@ async function cmd(pi, name, args) {
   const def = pi.commands.get(name);
   if (!def) throw new Error(`command not registered: ${name}`);
   await def.handler(args, makeCtx(pi));
+}
+
+/** Start a command without awaiting its handler (for in-flight command races). */
+function cmdAsync(pi, name, args) {
+  const def = pi.commands.get(name);
+  if (!def) throw new Error(`command not registered: ${name}`);
+  return def.handler(args, makeCtx(pi));
 }
 
 function pushMessages(pi, texts) {
@@ -238,12 +304,15 @@ function assertEq(actual, expected, label) {
 async function runTest(name, fn) {
   resetTimers();
   globalThis.__ARN__.completeCalls = [];
+  globalThis.__ARN__.compatCalls = [];
   clock.now = 1_700_000_000_000;
   resetKeyPolicy();
   writeConfig({ autoRename: true, continuousRename: false, style: "concise", language: "auto" });
   console.log(`\n=== ${name} ===`);
   try {
     await fn();
+    await tick();
+    assertEq(pendingTimerCount(), 0, `${name}: no request timer leaked`);
   } catch (e) {
     failures++;
     console.error(`  ERROR ${name}:`, e);
@@ -399,14 +468,18 @@ async function t2() {
   mod.default(pi);
   await fire(pi, "session_start");
 
-  // First failure: getAuth fails before complete is ever called
+  // First failure: the registry fails auth before any request is dispatched
   pushMessages(pi, ["q1", "q2", "q3"]);
   await fire(pi, "message_end");
   await tick();
-  assertEq(globalThis.__ARN__.completeCalls.length, 0, "T2 failure happened before complete (auth stage)");
+  assertEq(globalThis.__ARN__.completeCalls.length, 0, "T2 failure happened before the request (auth stage)");
   let warnings = pi.notifications.filter((n) => n.level === "warning");
   assertEq(warnings.length, 1, "T2 exactly 1 warning after first failure");
   assert(warnings[0]?.message.includes("Auto rename skipped"), "T2 warning is 'Auto rename skipped'");
+  assert(
+    warnings[0]?.message.includes("Provider is not configured: nokey"),
+    "T2 warning carries the registry's auth error",
+  );
 
   // Same-turn second message_end must NOT retry (breaker active)
   pushMessages(pi, ["q4", "q5"]);
@@ -697,7 +770,7 @@ async function t9() {
 
 // =====================================================================
 // =====================================================================
-// T10 — complete() contract: apiKey/headers/maxTokens/signal forwarded
+// T10 — naming call contract: registry path, maxTokens/signal forwarded
 // =====================================================================
 async function t10() {
   const pi = makePi({});
@@ -709,14 +782,885 @@ async function t10() {
   await fire(pi, "message_end");
   await tick();
   const call = globalThis.__ARN__.completeCalls[0];
-  assertEq(call.options.apiKey, "test-key", "T10 apiKey forwarded");
-  assertEq(call.options.headers["X-Test"], "1", "T10 headers forwarded");
   assertEq(call.options.maxTokens, 64, "T10 maxTokens = 64");
   assert(!!call.options.signal, "T10 abort signal forwarded");
+  assertEq(call.options.apiKey, undefined, "T10 extension does not pass apiKey — the registry resolves auth");
+  assertEq(call.options.headers, undefined, "T10 extension does not pass headers — the registry resolves auth");
   assertEq(call.model.provider, "faux", "T10 default naming model follows session model (faux)");
   assertEq(call.model.id, "model-a", "T10 session model id used");
   const sys = call.context.systemPrompt;
   assert(sys.includes("You create short, descriptive titles"), "T10 system prompt passed");
+  assertEq(globalThis.__ARN__.compatCalls.length, 0, "T10 naming never falls back to @earendil-works/pi-ai/compat");
+}
+
+// =====================================================================
+// T11 — regression: provider-extension api id (cliproxyapi-style) names fine
+//       Before the registry switch this produced
+//       "Auto rename skipped: No API provider registered for api:
+//        cliproxyapi-codex-responses" and left the session unnamed.
+// =====================================================================
+async function t11() {
+  writeConfig({
+    autoRename: true,
+    continuousRename: false,
+    style: "concise",
+    language: "auto",
+    model: { provider: "cliproxy", id: "codex-model" },
+  });
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+  setComplete(okComplete("Custom Api Title"));
+  pushMessages(pi, ["k1", "k2", "k3"]);
+  await fire(pi, "message_end");
+  await tick();
+
+  const call = globalThis.__ARN__.completeCalls[0];
+  assertEq(call?.model?.api, "cliproxyapi-codex-responses", "T11 override model keeps its extension api id");
+  assertEq(pi.name, "Custom Api Title", "T11 session named through the registry");
+  const warnings = pi.notifications.filter((n) => n.level === "warning");
+  assertEq(warnings.length, 0, "T11 no 'No API provider registered for api' warning");
+  assertEq(globalThis.__ARN__.compatCalls.length, 0, "T11 naming never falls back to @earendil-works/pi-ai/compat");
+}
+
+// =====================================================================
+// T12 — R1 nonblocking: every automatic handler returns while the title
+//       request is unresolved (provider ignores abort and never settles)
+// =====================================================================
+async function t12() {
+  writeConfig({ autoRename: true, continuousRename: true, style: "concise", language: "auto" });
+
+  // session_start
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    globalThis.__ARN__.completeCalls = [];
+    pushMessages(pi, ["s1", "s2", "s3"]);
+    setComplete(neverComplete());
+    let settled = false;
+    const p = fireAsync(pi, "session_start").then(() => {
+      settled = true;
+    });
+    await tick();
+    assert(settled, "T12 session_start returned while the title request was unresolved");
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T12 session_start dispatched exactly one title request");
+    assertEq(pendingTimerCount(), 1, "T12 session_start left the independent deadline armed");
+    await fire(pi, "session_shutdown", { reason: "quit" });
+    await tick();
+    await tick();
+    assertEq(pendingTimerCount(), 0, "T12 shutdown cleared the deadline timer");
+    await p;
+  }
+
+  // message_end
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    globalThis.__ARN__.completeCalls = [];
+    await fire(pi, "session_start");
+    pushMessages(pi, ["m1", "m2", "m3"]);
+    setComplete(neverComplete());
+    let settled = false;
+    const p = fireAsync(pi, "message_end").then(() => {
+      settled = true;
+    });
+    await tick();
+    assert(settled, "T12 message_end returned while the title request was unresolved");
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T12 message_end dispatched exactly one title request");
+    await fire(pi, "session_shutdown", { reason: "quit" });
+    await tick();
+    await tick();
+    await p;
+  }
+
+  // agent_settled (continuous)
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    globalThis.__ARN__.completeCalls = [];
+    await fire(pi, "session_start");
+    setComplete(okComplete("Base Title"));
+    pushMessages(pi, ["a1", "a2", "a3"]);
+    await fire(pi, "message_end");
+    await tick();
+    assertEq(pi.name, "Base Title", "T12 continuous base name set");
+
+    pushMessages(pi, ["b1", "b2", "b3"]);
+    clock.now += 6 * 60 * 1000;
+    setComplete(neverComplete());
+    let settled = false;
+    const p = fireAsync(pi, "agent_settled").then(() => {
+      settled = true;
+    });
+    await tick();
+    assert(settled, "T12 agent_settled returned while the title request was unresolved");
+    assertEq(globalThis.__ARN__.completeCalls.length, 2, "T12 agent_settled dispatched the continuous title request");
+    await fire(pi, "session_shutdown", { reason: "quit" });
+    await tick();
+    await tick();
+    await p;
+  }
+}
+
+// =====================================================================
+// T13 — single flight: repeated events during a pending request launch none
+// =====================================================================
+async function t13() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["f1", "f2", "f3"]);
+  const p1 = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T13 first title request dispatched");
+
+  const p2 = fireAsync(pi, "message_end");
+  const p3 = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T13 single-flight: repeated events did not duplicate the request");
+
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "First Title" }], usage: {} });
+  await p1;
+  await p2;
+  await p3;
+  await tick();
+  assertEq(pi.name, "First Title", "T13 the single request applied");
+}
+
+// =====================================================================
+// T14 — session_shutdown cancels: stale success is silent, no cooldown
+// =====================================================================
+async function t14() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["g1", "g2", "g3"]);
+  const pending = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T14 request in flight");
+
+  await fire(pi, "session_shutdown", { reason: "reload" });
+  await tick();
+  assertEq(pendingTimerCount(), 0, "T14 shutdown cleared the title deadline timer");
+
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Too Late" }], usage: {} });
+  await pending;
+  await tick();
+  await tick();
+  assertEq(pi.name, undefined, "T14 late success after shutdown did not set the name");
+  assertEq(pi.notifications.filter((n) => n.level === "warning").length, 0, "T14 lifecycle cancellation produced no stale warning");
+  assertEq(pi.notifications.filter((n) => n.message.includes("Session named")).length, 0, "T14 lifecycle cancellation produced no stale notification");
+
+  // No failure cooldown was recorded: an immediate retry is allowed.
+  setComplete(okComplete("Fresh Title"));
+  await fire(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T14 no cooldown after lifecycle cancellation (retry ran)");
+  assertEq(pi.name, "Fresh Title", "T14 retry after cancellation named the session");
+}
+
+// =====================================================================
+// T15 — branch navigation invalidates branch-bound work
+// =====================================================================
+async function t15() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["t1", "t2", "t3"]);
+  const pending = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T15 request in flight");
+
+  await fire(pi, "session_before_tree", { preparation: {}, signal: new AbortController().signal });
+  await tick();
+  assertEq(pendingTimerCount(), 0, "T15 before_tree cancelled the pending title");
+  await fire(pi, "session_tree", { newLeafId: "x", oldLeafId: "y" });
+  await tick();
+
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Stale Tree Title" }], usage: {} });
+  await pending;
+  await tick();
+  await tick();
+  assertEq(pi.name, undefined, "T15 stale branch result did not apply after tree navigation");
+  assertEq(pi.notifications.filter((n) => n.level === "warning").length, 0, "T15 no warning for superseded branch work");
+}
+
+// =====================================================================
+// T16 — manual rename supersedes an in-flight first naming (silent)
+// =====================================================================
+async function t16() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["u1", "u2", "u3"]);
+  const pending = fireAsync(pi, "message_end");
+  await tick();
+  pi.setSessionName("User Name");
+  await tick();
+  assertEq(pi.name, "User Name", "T16 manual rename applied");
+
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Auto Loser" }], usage: {} });
+  await pending;
+  await tick();
+  await tick();
+  assertEq(pi.name, "User Name", "T16 auto result dropped after manual rename");
+  assertEq(pi.notifications.filter((n) => n.message.includes("named:")).length, 0, "T16 no stale auto 'named' notification");
+  assertEq(pi.notifications.filter((n) => n.level === "warning").length, 0, "T16 manual supersession is silent");
+}
+
+// =====================================================================
+// T17 — disabling a mode invalidates only the affected automatic request
+// =====================================================================
+async function t17() {
+  writeConfig({ autoRename: true, continuousRename: true, style: "concise", language: "auto" });
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+  setComplete(okComplete("Base"));
+  pushMessages(pi, ["c1", "c2", "c3"]);
+  await fire(pi, "message_end");
+  await tick();
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["c4", "c5", "c6"]);
+  clock.now += 6 * 60 * 1000;
+  const pending = fireAsync(pi, "agent_settled");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T17 continuous request in flight");
+
+  await cmd(pi, "rename-config", "continuous off");
+  await tick();
+  assertEq(pendingTimerCount(), 0, "T17 disabling continuous cancelled the pending continuous title");
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Should Not Apply" }], usage: {} });
+  await pending;
+  await tick();
+  await tick();
+  assertEq(pi.name, "Base", "T17 disabled-mode result did not rename");
+  assertEq(pi.notifications.filter((n) => n.level === "warning").length, 0, "T17 mode-disable cancellation is silent");
+}
+
+// =====================================================================
+// T18 — a stale request's finally must not release a newer owner
+// =====================================================================
+async function t18() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const a = abortResistantComplete();
+  setComplete(a.fn);
+  pushMessages(pi, ["x1", "x2", "x3"]);
+  const pa = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T18 request A dispatched");
+
+  // Supersede A, then start B.
+  await fire(pi, "session_shutdown", { reason: "reload" });
+  await tick();
+  const b = abortResistantComplete();
+  setComplete(b.fn);
+  const pb = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T18 request B dispatched after A was superseded");
+
+  // Resolve A late: its finally must not release B's single-flight guard.
+  a.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Late A" }], usage: {} });
+  await pa;
+  await tick();
+  const pExtra = fireAsync(pi, "message_end");
+  await tick();
+  await pExtra;
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T18 stale A did not release B's single-flight guard");
+  assertEq(pi.name, undefined, "T18 stale A did not set the name");
+
+  b.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Fresh B" }], usage: {} });
+  await pb;
+  await tick();
+  assertEq(pi.name, "Fresh B", "T18 the newer request B still applied");
+}
+
+// =====================================================================
+// T19 — a normal message append must not stale a valid title request
+// =====================================================================
+async function t19() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["n1", "n2", "n3"]);
+  const pending = fireAsync(pi, "message_end");
+  await tick();
+
+  // Normal appends advance the leaf; they must not invalidate the request.
+  pushMessages(pi, ["n4"]);
+  pushAssistant(pi, "n5");
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Still Valid" }], usage: {} });
+  await pending;
+  await tick();
+  assertEq(pi.name, "Still Valid", "T19 normal message appends did not invalidate the title request");
+}
+
+// =====================================================================
+// T20 — independent deadline and cancellation in generateName
+// =====================================================================
+async function t20() {
+  const { generateName } = await import("../naming.ts");
+  const cfg = { autoRename: true, continuousRename: false, style: "concise", language: "auto" };
+
+  // (a) no external signal + abort-ignoring provider -> local deadline
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    let capturedSignal;
+    setComplete((_m, _c, options) => {
+      capturedSignal = options.signal;
+      return new Promise(() => {});
+    });
+    const p = generateName(ctx, cfg, "first", "hi");
+    await tick();
+    assertEq(pendingTimerCount(), 1, "T20a deadline timer armed without an external signal");
+    clock.now += 30_000;
+    fireAllTimers();
+    const result = await p;
+    assertEq(result.reason, "timeout", "T20a settled locally with a timeout reason");
+    assertEq(capturedSignal.aborted, true, "T20a provider signal was aborted");
+    assertEq(pendingTimerCount(), 0, "T20a timer cleaned up");
+  }
+
+  // (b) external signal that never aborts -> still an independent deadline
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    const external = new AbortController();
+    setComplete(neverComplete());
+    const p = generateName(ctx, cfg, "first", "hi", { signal: external.signal });
+    await tick();
+    assertEq(pendingTimerCount(), 1, "T20b deadline timer armed despite an external signal");
+    fireAllTimers();
+    const result = await p;
+    assertEq(result.reason, "timeout", "T20b independent deadline still fired");
+    assertEq(pendingTimerCount(), 0, "T20b timer cleaned up");
+  }
+
+  // (c) already-aborted external signal -> immediate cancellation, no dispatch
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    const external = new AbortController();
+    external.abort();
+    globalThis.__ARN__.completeCalls = [];
+    setComplete(() => {
+      throw new Error("must not dispatch");
+    });
+    const result = await generateName(ctx, cfg, "first", "hi", { signal: external.signal });
+    assertEq(result.reason, "cancelled", "T20c pre-aborted signal cancelled immediately");
+    assertEq(globalThis.__ARN__.completeCalls.length, 0, "T20c pre-aborted signal did not dispatch");
+    assertEq(pendingTimerCount(), 0, "T20c no timer left behind");
+  }
+
+  // (d) external abort mid-flight -> cancelled + cleanup
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    const external = new AbortController();
+    setComplete(neverComplete());
+    const p = generateName(ctx, cfg, "first", "hi", { signal: external.signal });
+    await tick();
+    external.abort();
+    const result = await p;
+    assertEq(result.reason, "cancelled", "T20d upstream abort settled as cancelled");
+    assertEq(pendingTimerCount(), 0, "T20d timer cleaned up");
+  }
+}
+
+// =====================================================================
+// T21 — a late provider rejection is contained (no unhandledRejection)
+// =====================================================================
+async function t21() {
+  const { generateName } = await import("../naming.ts");
+  const cfg = { autoRename: true, continuousRename: false, style: "concise", language: "auto" };
+  const pi = makePi({});
+  const ctx = makeCtx(pi);
+  let rejectLate;
+  setComplete(() => new Promise((_res, rej) => {
+    rejectLate = rej;
+  }));
+  const p = generateName(ctx, cfg, "first", "hi");
+  await tick();
+  fireAllTimers();
+  const result = await p;
+  assertEq(result.reason, "timeout", "T21 settled on the local deadline");
+  rejectLate(new Error("late provider failure"));
+  await tick();
+  await tick();
+  assertEq(unhandledRejections.length, 0, "T21 late provider rejection was contained");
+}
+
+// =====================================================================
+// T22 — awaited /rename (AI) drops a result after a session/branch or name change
+// =====================================================================
+async function t22() {
+  // (a) session transition while the command awaits its title
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    pushMessages(pi, ["h1", "h2", "h3"]);
+
+    const hang = abortResistantComplete();
+    setComplete(hang.fn);
+    const running = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T22a history rename dispatched");
+
+    await fire(pi, "session_shutdown", { reason: "new" });
+    await tick();
+    hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Stale Command Title" }], usage: {} });
+    await running;
+    await tick();
+    assertEq(pi.name, undefined, "T22a session transition dropped the manual AI title");
+  }
+
+  // (b) a later external rename wins over the in-flight manual command
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    pushMessages(pi, ["k1", "k2", "k3"]);
+
+    const hang = abortResistantComplete();
+    setComplete(hang.fn);
+    const running = cmdAsync(pi, "rename", "");
+    await tick();
+    pi.setSessionName("User Wins");
+    await tick();
+    hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Command Title" }], usage: {} });
+    await running;
+    await tick();
+    assertEq(pi.name, "User Wins", "T22b later rename won over the in-flight manual AI result");
+  }
+}
+
+// =====================================================================
+// T23 — auto-off cancels an in-flight first naming (silent)
+// =====================================================================
+async function t23() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  const hang = abortResistantComplete();
+  setComplete(hang.fn);
+  pushMessages(pi, ["a1", "a2", "a3"]);
+  const pending = fireAsync(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T23 first request in flight");
+
+  await cmd(pi, "rename-config", "auto off");
+  await tick();
+  assertEq(pendingTimerCount(), 0, "T23 auto-off cancelled the pending first request");
+  hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Should Not Apply" }], usage: {} });
+  await pending;
+  await tick();
+  await tick();
+  assertEq(pi.name, undefined, "T23 auto-off result did not apply");
+  assertEq(pi.notifications.filter((n) => n.level === "warning").length, 0, "T23 auto-off cancellation is silent");
+}
+
+// =====================================================================
+// T24 — explicit /rename (AI) request ownership: clear, ABA, newer request,
+//       auto suspension during the command, and shutdown cancellation
+// =====================================================================
+async function t24() {
+  writeConfig({ autoRename: true, continuousRename: true, style: "concise", language: "auto" });
+
+  // (a) explicit clear while /rename (AI) is pending must win
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    pushMessages(pi, ["h1", "h2", "h3"]);
+    globalThis.__ARN__.completeCalls = [];
+
+    const hang = abortResistantComplete();
+    setComplete(hang.fn);
+    const running = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T24a history rename dispatched");
+
+    // The name was undefined and the user explicitly clears it again: name
+    // equality alone (undefined === undefined) must not let the result apply.
+    pi.setSessionName(undefined);
+    await tick();
+    hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Stale Clear Title" }], usage: {} });
+    await running;
+    await tick();
+    await tick();
+    assertEq(pi.name, undefined, "T24a explicit clear during pending /rename wins");
+    assertEq(pi.notifications.filter((n) => n.message.includes("Session named")).length, 0, "T24a no stale manual notification");
+  }
+
+  // (b) same-name ABA (A -> B -> A) during /rename (AI) must not overwrite
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    pushMessages(pi, ["a1", "a2", "a3"]);
+    pi.setSessionName("A");
+    await tick();
+    globalThis.__ARN__.completeCalls = [];
+
+    const hang = abortResistantComplete();
+    setComplete(hang.fn);
+    const running = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T24b history rename dispatched");
+
+    pi.setSessionName("B");
+    await tick();
+    pi.setSessionName("A");
+    await tick();
+    hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "ABA Winner" }], usage: {} });
+    await running;
+    await tick();
+    await tick();
+    assertEq(pi.name, "A", "T24b same-name ABA did not let the stale result apply");
+  }
+
+  // (c) a newer manual /rename (AI) supersedes the earlier one
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    pushMessages(pi, ["n1", "n2", "n3"]);
+    globalThis.__ARN__.completeCalls = [];
+
+    const first = abortResistantComplete();
+    setComplete(first.fn);
+    const runningFirst = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T24c first history rename dispatched");
+
+    const second = abortResistantComplete();
+    setComplete(second.fn);
+    const runningSecond = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 2, "T24c second history rename dispatched");
+
+    second.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Second Title" }], usage: {} });
+    await runningSecond;
+    await tick();
+    assertEq(pi.name, "Second Title", "T24c newer manual request applied");
+
+    first.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "First Title" }], usage: {} });
+    await runningFirst;
+    await tick();
+    await tick();
+    assertEq(pi.name, "Second Title", "T24c superseded manual request did not overwrite the newer one");
+  }
+
+  // (d) automatic events during a pending /rename (AI) must not dispatch auto work
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    setComplete(okComplete("Base"));
+    pushMessages(pi, ["g1", "g2", "g3"]);
+    await fire(pi, "message_end");
+    await tick();
+    assertEq(pi.name, "Base", "T24d base name set");
+    globalThis.__ARN__.completeCalls = [];
+
+    const hang = abortResistantComplete();
+    setComplete(hang.fn);
+    const running = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T24d manual request in flight");
+
+    pushMessages(pi, ["g4", "g5", "g6"]);
+    clock.now += 6 * 60 * 1000;
+    await fire(pi, "message_end");
+    await fire(pi, "agent_settled");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T24d auto events did not dispatch while the manual request was pending");
+
+    hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Manual Title" }], usage: {} });
+    await running;
+    await tick();
+    assertEq(pi.name, "Manual Title", "T24d manual request applied after auto was suspended");
+  }
+
+  // (e) session_shutdown cancels a pending /rename (AI)
+  {
+    const pi = makePi({});
+    const mod = await import("../index.ts");
+    mod.default(pi);
+    await fire(pi, "session_start");
+    pushMessages(pi, ["s1", "s2", "s3"]);
+    globalThis.__ARN__.completeCalls = [];
+
+    const hang = abortResistantComplete();
+    setComplete(hang.fn);
+    const running = cmdAsync(pi, "rename", "");
+    await tick();
+    assertEq(globalThis.__ARN__.completeCalls.length, 1, "T24e manual request in flight");
+
+    await fire(pi, "session_shutdown", { reason: "reload" });
+    await tick();
+    assertEq(pendingTimerCount(), 0, "T24e shutdown cleared the manual request deadline");
+    hang.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Too Late Manual" }], usage: {} });
+    await running;
+    await tick();
+    await tick();
+    assertEq(pi.name, undefined, "T24e shutdown cancelled the pending manual request");
+
+    // Failure/cancellation restores automatic eligibility (no permanent manual).
+    setComplete(okComplete("Auto After Manual Cancel"));
+    await fire(pi, "message_end");
+    await tick();
+    assertEq(pi.name, "Auto After Manual Cancel", "T24e automatic naming recovered after manual cancellation");
+  }
+}
+
+// =====================================================================
+// T25 — generateName always releases its deadline timer and listeners
+// =====================================================================
+async function t25() {
+  const { generateName } = await import("../naming.ts");
+  const cfg = { autoRename: true, continuousRename: false, style: "concise", language: "auto" };
+
+  // success path releases the timer
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    setComplete(okComplete("Clean Title"));
+    const external = new AbortController();
+    const result = await generateName(ctx, cfg, "first", "hi", { signal: external.signal });
+    assertEq(result.name, "Clean Title", "T25 success path returned a name");
+    assertEq(pendingTimerCount(), 0, "T25 success path released the deadline timer");
+    // Aborting the (now irrelevant) upstream signal must be harmless.
+    external.abort();
+    assertEq(result.name, "Clean Title", "T25 late upstream abort did not disturb the settled result");
+  }
+
+  // auth/provider failure path releases the timer
+  {
+    const pi = makePi({ sessionModel: MODELS.nokey["model-b"] });
+    const ctx = makeCtx(pi);
+    const result = await generateName(ctx, cfg, "first", "hi");
+    assert(!!result.error, "T25 auth failure returned an error");
+    assertEq(pendingTimerCount(), 0, "T25 auth failure released the deadline timer");
+  }
+}
+
+// =====================================================================
+// T26 — actual session replacement and stale contexts/errors/finalizers.
+// Start the newer request before the cancelled owner's continuation runs.
+// =====================================================================
+async function t26() {
+  const pi = makePi({ sessionId: "outgoing" });
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+  pushMessages(pi, ["outgoing history"]);
+  const oldCtx = makeCtx(pi);
+  let oldContextInvalid = false;
+  let staleReads = 0;
+  for (const key of ["model", "modelRegistry", "sessionManager", "ui"]) {
+    const value = oldCtx[key];
+    Object.defineProperty(oldCtx, key, { get() {
+      if (oldContextInvalid) {
+        staleReads++;
+        throw new Error("outgoing context was invalidated");
+      }
+      return value;
+    } });
+  }
+  let rejectOld;
+  setComplete(() => new Promise((_resolve, reject) => { rejectOld = reject; }));
+  await pi.handlers.get("message_end")({}, oldCtx);
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T26 outgoing request dispatched");
+
+  // No await between invalidation and reservation of the incoming owner.
+  const shutdown = fireAsync(pi, "session_shutdown", { reason: "new" });
+  oldContextInvalid = true;
+  pi._opts.sessionId = "incoming";
+  pi.entries = [];
+  pushMessages(pi, ["incoming history"]);
+  const incoming = abortResistantComplete();
+  setComplete(incoming.fn);
+  const start = fireAsync(pi, "session_start", { reason: "new" });
+  await Promise.all([shutdown, start]);
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T26 incoming session reserved its request");
+  rejectOld(new Error("late outgoing provider failure"));
+  await tick();
+  await fire(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T26 old finalizer/error did not release the newer guard");
+  assertEq(staleReads, 0, "T26 old context was never accessed after invalidation");
+  assertEq(pi.notifications.length, 0, "T26 late outgoing failure caused no stale notification");
+  assertEq(pi.entries.filter((e) => e.type === "custom").length, 0, "T26 stale failure wrote no incoming state");
+  incoming.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Incoming Title" }] });
+  await tick();
+  assertEq(pi.name, "Incoming Title", "T26 incoming owner still applied");
+  assertEq(unhandledRejections.length, 0, "T26 late outgoing rejection was contained");
+}
+
+// =====================================================================
+// T27 — manual failure restores eligibility; config-off never cancels manual.
+// =====================================================================
+async function t27() {
+  const mod = await import("../index.ts");
+  const pi = makePi({});
+  mod.default(pi);
+  await fire(pi, "session_start");
+  pushMessages(pi, ["history"]);
+  const auto = abortResistantComplete();
+  setComplete(auto.fn);
+  await fire(pi, "message_end");
+  await tick();
+  const autoSignal = globalThis.__ARN__.completeCalls[0].options.signal;
+  let rejectManual;
+  setComplete(() => new Promise((_resolve, reject) => { rejectManual = reject; }));
+  const manual = cmdAsync(pi, "rename", "");
+  await tick();
+  assertEq(autoSignal.aborted, true, "T27 manual AI superseded the automatic request");
+  await fire(pi, "message_end");
+  assertEq(globalThis.__ARN__.completeCalls.length, 2, "T27 automatic events were suspended during manual AI");
+  rejectManual(new Error("manual provider failed"));
+  await manual;
+  assertEq(pi.entries.filter((e) => e.type === "custom").length, 0, "T27 failed manual AI did not mark the session manual");
+  assertEq(pi.notifications.filter((n) => n.level === "error").length, 1, "T27 current manual failure reported once");
+  setComplete(okComplete("Recovery"));
+  await fire(pi, "message_end");
+  await tick();
+  assertEq(pi.name, "Recovery", "T27 automatic naming was immediately eligible after manual failure");
+  auto.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Stale Auto" }] });
+  await tick();
+  assertEq(pi.name, "Recovery", "T27 superseded auto success did not overwrite recovery");
+
+  const pending = abortResistantComplete();
+  setComplete(pending.fn);
+  const explicit = cmdAsync(pi, "rename", "");
+  await tick();
+  const explicitSignal = globalThis.__ARN__.completeCalls.at(-1).options.signal;
+  await cmd(pi, "rename-config", "auto off");
+  await cmd(pi, "rename-config", "continuous off");
+  assertEq(explicitSignal.aborted, false, "T27 disabling automatic modes did not cancel explicit AI");
+  pending.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Explicit Still Works" }] });
+  await explicit;
+  assertEq(pi.name, "Explicit Still Works", "T27 explicit AI remained usable with automatic modes off");
+}
+
+// =====================================================================
+// T28 — directly count owned listeners on every generateName exit path.
+// =====================================================================
+async function t28() {
+  const { generateName } = await import("../naming.ts");
+  const cfg = { autoRename: true, continuousRename: false, style: "concise", language: "auto" };
+  for (const outcome of ["success", "provider-failure", "timeout", "cancel", "pre-aborted"]) {
+    const external = new AbortController();
+    let providerSignal;
+    setComplete((_model, _context, options) => {
+      providerSignal = options.signal;
+      if (outcome === "success") return okComplete("Listeners Clean")();
+      if (outcome === "provider-failure") return Promise.reject(new Error("provider failure"));
+      return new Promise(() => {});
+    });
+    if (outcome === "pre-aborted") external.abort();
+    const resultPromise = generateName(makeCtx(makePi({ signal: external.signal })), cfg, "first", "hi");
+    if (outcome === "timeout" || outcome === "cancel") {
+      await tick();
+      assertEq(getEventListeners(external.signal, "abort").length, 1, `T28 ${outcome}: upstream listener attached`);
+      assertEq(getEventListeners(providerSignal, "abort").length, 1, `T28 ${outcome}: local listener attached`);
+      if (outcome === "timeout") fireAllTimers();
+      else external.abort();
+    }
+    await resultPromise;
+    assertEq(getEventListeners(external.signal, "abort").length, 0, `T28 ${outcome}: upstream listener removed`);
+    if (providerSignal) assertEq(getEventListeners(providerSignal, "abort").length, 0, `T28 ${outcome}: local listener removed`);
+    assertEq(pendingTimerCount(), 0, `T28 ${outcome}: timer removed`);
+    if (outcome !== "cancel" && outcome !== "pre-aborted") assertEq(external.signal.aborted, false, `T28 ${outcome}: upstream controller was not aborted`);
+  }
+
+  // Automatic work must not inherit the primary Agent's cancellation source.
+  const primary = new AbortController();
+  const pi = makePi({ signal: primary.signal });
+  (await import("../index.ts")).default(pi);
+  await fire(pi, "session_start");
+  pushMessages(pi, ["hello"]);
+  const pending = abortResistantComplete();
+  setComplete(pending.fn);
+  await fire(pi, "message_end");
+  await tick();
+  primary.abort();
+  pending.d.resolve({ stopReason: "stop", content: [{ type: "text", text: "Session Owned" }] });
+  await tick();
+  assertEq(pi.name, "Session Owned", "T28 primary Agent abort did not cancel session-owned automatic naming");
+}
+
+// =====================================================================
+// T29 — tree navigation does not confuse historical auto state with manual.
+// =====================================================================
+async function t29() {
+  writeConfig({ autoRename: true, continuousRename: true, style: "concise", language: "auto" });
+  const pi = makePi({});
+  (await import("../index.ts")).default(pi);
+  await fire(pi, "session_start");
+  pushMessages(pi, ["old branch"]);
+  setComplete(okComplete("File Wide Name"));
+  await fire(pi, "message_end");
+  await tick();
+  await fire(pi, "session_before_tree");
+  pi.entries = [];
+  pushMessages(pi, ["historical branch"]);
+  pi.appendEntry("pi-auto-rename:state", { name: "Historical Auto Name", source: "auto", timestamp: clock.now });
+  await fire(pi, "session_tree");
+  assertEq(pi.name, "File Wide Name", "T29 tree kept the file-wide title");
+  clock.now += FIVE_MIN + 1;
+  pushMessages(pi, ["one new message", "two new messages"]);
+  await fire(pi, "agent_settled");
+  assertEq(globalThis.__ARN__.completeCalls.length, 1, "T29 tree refreshed the message threshold");
+  pushMessages(pi, ["three new messages"]);
+  setComplete(okComplete("Current Branch Title"));
+  await fire(pi, "agent_settled");
+  await tick();
+  assertEq(pi.name, "Current Branch Title", "T29 historical auto state did not falsely install a manual flag");
 }
 
 // =====================================================================
@@ -734,11 +1678,36 @@ const tests = [
   ["T7 AC3 /rename forms", t7],
   ["T8 AC8 sanitize + prompts", t8],
   ["T9 R10 config round-trip defaults", t9],
-  ["T10 complete() contract", t10],
+  ["T10 naming call contract (registry path)", t10],
+  ["T11 provider-extension api id (cliproxyapi-style) names via registry", t11],
+  ["T12 nonblocking: automatic handlers return while the title is unresolved", t12],
+  ["T13 single-flight: repeated events launch no duplicate request", t13],
+  ["T14 session_shutdown cancels: stale success silent, no cooldown", t14],
+  ["T15 branch navigation invalidates branch-bound work", t15],
+  ["T16 manual rename supersedes in-flight first naming", t16],
+  ["T17 mode disable cancels only the affected request", t17],
+  ["T18 stale finally does not release a newer owner", t18],
+  ["T19 normal message append does not stale a valid request", t19],
+  ["T20 independent deadline and cancellation in generateName", t20],
+  ["T21 late provider rejection is contained", t21],
+  ["T22 /rename (AI) drops stale session/branch/name results", t22],
+  ["T23 auto-off cancels in-flight first naming", t23],
+  ["T24 explicit /rename (AI) request ownership", t24],
+  ["T25 generateName releases timer/listeners on all exits", t25],
+  ["T26 session replacement: stale context/error/finalizer protection", t26],
+  ["T27 manual failure recovery and mode-disable independence", t27],
+  ["T28 direct listener cleanup and primary cancellation isolation", t28],
+  ["T29 tree navigation preserves file-wide name ownership", t29],
 ];
 
 for (const [name, fn] of tests) {
   await runTest(name, fn);
+}
+
+await tick();
+if (unhandledRejections.length > 0) {
+  failures++;
+  console.error(`  FAIL  ${unhandledRejections.length} unhandled rejection(s); first:`, unhandledRejections[0]);
 }
 
 console.log(`\n========== SUMMARY: ${passes} passed, ${failures} failed ==========`);

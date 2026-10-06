@@ -1,0 +1,8 @@
+{
+  "defaultProvider": "fauxapi",
+  "defaultModel": "naming-model",
+  "defaultThinkingLevel": "off",
+  "defaultProjectTrust": "never",
+  "quietStartup": true,
+  "enableInstallTelemetry": false
+}

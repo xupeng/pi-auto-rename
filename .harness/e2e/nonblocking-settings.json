@@ -1,0 +1,8 @@
+{
+  "defaultProvider": "e2enp",
+  "defaultModel": "np-model",
+  "defaultThinkingLevel": "off",
+  "defaultProjectTrust": "never",
+  "quietStartup": true,
+  "enableInstallTelemetry": false
+}

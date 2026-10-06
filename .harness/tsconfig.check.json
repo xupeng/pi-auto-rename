@@ -1,4 +1,11 @@
 {
+  // Typecheck harness. The @earendil-works declarations are resolved from a
+  // locally readable runtime (pi-web, Pi 1.0.0) because the previous
+  // version-pinned pnpm store paths no longer exist on this machine. The
+  // extension still advertises pi >= 0.84: every API used here
+  // (modelRegistry.complete, session_shutdown, session_before_tree, session_tree,
+  // sessionManager.getSessionId/getLeafId) is present in 0.84.0. Repoint these
+  // paths if the local checkout moves.
   "compilerOptions": {
     "strict": true,
     "noEmit": true,
@@ -9,18 +16,19 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
+    "typeRoots": ["/home/xupeng/services/pi-web/dist/node_modules/@types"],
     "paths": {
       "@earendil-works/pi-coding-agent": [
-        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-coding-agent@0.84.3_ws@8.21.3_zod@4.4.3/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
+        "/home/xupeng/services/pi-web/dist/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
       ],
       "@earendil-works/pi-ai": [
-        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-ai@0.84.3_ws@8.21.3/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
+        "/home/xupeng/services/pi-web/dist/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
       ],
       "@earendil-works/pi-ai/compat": [
-        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-ai@0.84.3_ws@8.21.3/node_modules/@earendil-works/pi-ai/dist/compat.d.ts"
+        "/home/xupeng/services/pi-web/dist/node_modules/@earendil-works/pi-ai/dist/compat.d.ts"
       ],
       "@earendil-works/pi-tui": [
-        "/home/xupeng/.local/share/pnpm/global/5/.pnpm/@earendil-works+pi-tui@0.84.3/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
+        "/home/xupeng/services/pi-web/dist/node_modules/@earendil-works/pi-tui/dist/index.d.ts"
       ]
     }
   },

@@ -10,6 +10,9 @@ behavior is configurable and predictable, and it never overwrites a name you set
 - **Auto-naming on session start** — names the session once from the first 3 non-empty
   user/assistant messages (4000 chars each). Resumed sessions that have messages but no
   name get named too.
+- **Never blocks the agent** — automatic naming runs in the background on a
+  session-owned cancellation source. Replies, tool calls, and settlement never wait for
+  the title request.
 - **Language-aware, concise titles** — Chinese conversations get Chinese titles (≤12
   chars), English conversations get 2–6 word titles. Titles are capped at 80 chars, with
   no quotes or trailing punctuation.
@@ -26,8 +29,13 @@ behavior is configurable and predictable, and it never overwrites a name you set
 
 ## Requirements
 
-- pi ≥ 0.84 with `@earendil-works/pi-ai` ≥ 0.84 (naming calls use the
-  `@earendil-works/pi-ai/compat` subpath, where `complete()` lives in 0.84).
+- pi ≥ 0.84 with `ctx.modelRegistry.complete()` (pi's `ModelRegistry.complete`).
+  Naming calls go through the model registry, so models served by provider
+  extensions — including ones with custom api ids such as cliproxyapi's
+  `cliproxyapi-codex-responses` — work like builtin providers.
+- Automatic title requests are off the agent's execution path: each has its own
+  30-second deadline and its own cancellation, independent of provider cooperation, so a
+  slow or hung naming provider cannot stall the agent or wedge the extension state.
 - Node.js with jiti-based TS loading (pi's default; no compilation step).
 
 ## Installation
@@ -102,6 +110,11 @@ warning, so the extension always stays usable.
   `/resume`.
 - External renames are detected in `session_info_changed` by comparing the reported name
   with the name this extension last set.
+- A late automatic result is re-checked against the session/branch generation, the current
+  name, and the manual flag before it can apply. Session replacement, branch navigation,
+  shutdown, a manual rename, and disabling automatic naming all invalidate pending title
+  work, so a stale result cannot rename the session, persist stale state, emit a stale
+  notification, or release a newer request's single-flight guard.
 
 ## Known limitations
 
@@ -114,6 +127,9 @@ warning, so the extension always stays usable.
 - Naming runs only when a TUI is available for the model picker; in `print`/`json`/`rpc`
   modes `/rename-config model` (no args) shows a usage hint instead of a picker. Auto
   naming itself still works.
+- Automatic naming is best-effort in short-lived runs: `print`/`json` modes may shut down
+  and cancel an unfinished title before it is applied — the agent and process exit never
+  wait for a title.
 - Continuous naming never fires while an earlier naming request is in flight, and requires
   both the 5-minute and 3-message thresholds — so title updates lag topic shifts slightly
   by design.
@@ -124,7 +140,7 @@ warning, so the extension always stays usable.
 index.ts     # Entry: event bindings, state machine, commands
 config.ts    # Global config type, defaults, read/write
 state.ts     # Per-session state persistence (pi.appendEntry)
-naming.ts    # Model resolution, prompt building, complete() call, title sanitizing
+naming.ts    # Model resolution, prompt building, modelRegistry.complete() call, title sanitizing
 ui-config.ts # Interactive /rename-config wizard (TUI pickers, searchable model list)
 ```
 

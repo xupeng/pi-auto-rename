@@ -189,6 +189,8 @@ function makeCtx(pi) {
   return {
     model: opts.sessionModel ?? MODELS.faux["model-a"],
     scopedModels: opts.scopedModels ?? [],
+    // pi-web binds extensions with mode "rpc" and forwards notify() to the page.
+    mode: opts.mode ?? "tui",
     hasUI: opts.hasUI ?? true,
     signal: opts.signal, // undefined -> naming.ts own AbortController fallback
     modelRegistry: {
@@ -1664,6 +1666,92 @@ async function t29() {
 }
 
 // =====================================================================
+// T30 — naming notifications are terminal-only (pi-web runs extensions as rpc)
+// =====================================================================
+async function t30() {
+  writeConfig({ autoRename: true, continuousRename: true, style: "concise", language: "auto" });
+  const pi = makePi({ mode: "rpc", sessionModel: MODELS.nokey["model-b"] });
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  // Automatic failure: silent off-terminal, but the retry breaker still applies.
+  pushMessages(pi, ["q1", "q2", "q3"]);
+  await fire(pi, "message_end");
+  await tick();
+  assertEq(pi.notifications.length, 0, "T30 rpc: no warning for a failed automatic naming");
+  KEY_POLICY.nokey = { ok: true, apiKey: "now-key", headers: {} };
+  setComplete(okComplete("Too Early"));
+  await fire(pi, "message_end");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 0, "T30 rpc: failure cooldown still recorded");
+
+  // Automatic success: the title is applied without a notification.
+  clock.now += FIVE_MIN + 1000;
+  setComplete(okComplete("Web Title"));
+  await fire(pi, "message_end");
+  await tick();
+  assertEq(pi.name, "Web Title", "T30 rpc: first naming applied");
+
+  // Continuous rename: applied without a notification.
+  pushMessages(pi, ["c1", "c2", "c3"]);
+  clock.now += 6 * 60 * 1000;
+  setComplete(okComplete("Web Title B"));
+  await fire(pi, "agent_settled");
+  await tick();
+  assertEq(pi.name, "Web Title B", "T30 rpc: continuous rename applied");
+
+  // Continuous failure: silent.
+  pushMessages(pi, ["d1", "d2", "d3"]);
+  clock.now += 6 * 60 * 1000;
+  setComplete(okComplete("   "));
+  await fire(pi, "agent_settled");
+  await tick();
+  assertEq(globalThis.__ARN__.completeCalls.length, 3, "T30 rpc: continuous failure path ran");
+
+  // Manual /rename <name>: the sidebar title is the feedback, no toast.
+  await cmd(pi, "rename", "Typed Name");
+  assertEq(pi.name, "Typed Name", "T30 rpc: manual rename applied");
+  assertEq(pi.notifications.length, 0, "T30 rpc: no naming notification of any kind");
+}
+
+// =====================================================================
+// T31 — explicit command errors still reach non-terminal clients; tui unchanged
+// =====================================================================
+async function t31() {
+  const web = makePi({ mode: "rpc", sessionModel: MODELS.nokey["model-b"] });
+  const mod = await import("../index.ts");
+  mod.default(web);
+  await fire(web, "session_start");
+  pushMessages(web, ["q1"]);
+  await tick();
+  web.notifications.length = 0;
+  await cmd(web, "rename", "");
+  assertEq(web.notifications.length, 1, "T31 rpc: explicit /rename (AI) failure is reported");
+  assertEq(web.notifications[0]?.level, "error", "T31 rpc: reported as an error");
+
+  const tui = makePi({ sessionModel: MODELS.nokey["model-b"] });
+  mod.default(tui);
+  await fire(tui, "session_start");
+  pushMessages(tui, ["q1"]);
+  await fire(tui, "message_end");
+  await tick();
+  assert(
+    tui.notifications.some((n) => n.level === "warning" && n.message.includes("Auto rename skipped")),
+    "T31 tui: automatic failure warning still shown",
+  );
+  KEY_POLICY.nokey = { ok: true, apiKey: "now-key", headers: {} };
+  clock.now += FIVE_MIN + 1000;
+  setComplete(okComplete("Terminal Title"));
+  await fire(tui, "message_end");
+  await tick();
+  assert(
+    tui.notifications.some((n) => n.message === "Session named: Terminal Title"),
+    "T31 tui: success notification still shown",
+  );
+}
+
+// =====================================================================
 // runner
 // =====================================================================
 const tests = [
@@ -1698,6 +1786,8 @@ const tests = [
   ["T27 manual failure recovery and mode-disable independence", t27],
   ["T28 direct listener cleanup and primary cancellation isolation", t28],
   ["T29 tree navigation preserves file-wide name ownership", t29],
+  ["T30 naming notifications are terminal-only", t30],
+  ["T31 explicit errors still reported off-terminal; tui unchanged", t31],
 ];
 
 for (const [name, fn] of tests) {

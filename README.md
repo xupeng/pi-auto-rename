@@ -26,6 +26,10 @@ behavior is configurable and predictable, and it never overwrites a name you set
   configuration needed. Override it per-session-globally with `/rename-config model`.
 - **Graceful degradation** — if the naming model is unavailable or has no API key, auto
   naming skips silently with a warning notification; `/rename` reports a clear error.
+- **Quiet outside the terminal** — "Session named/renamed" and automatic-naming warnings
+  are shown only in the TUI. RPC clients such as pi-web (which turn every notification into
+  a toast and already display the title) see no naming toasts; explicit `/rename` and
+  `/rename-config` errors are still reported everywhere.
 
 ## Requirements
 

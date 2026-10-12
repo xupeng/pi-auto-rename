@@ -143,6 +143,21 @@ export default function autoRename(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Naming notifications are a terminal courtesy. RPC clients such as pi-web
+	 * forward every notify() as a toast and already show the title themselves, so
+	 * automatic naming (success or failure) and plain rename confirmations stay
+	 * silent there. Explicit command errors keep using notify().
+	 */
+	function notifyInTerminal(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
+		try {
+			if (ctx.mode !== "tui") return;
+		} catch {
+			return;
+		}
+		notify(ctx, message, level);
+	}
+
 	function errMessage(error: unknown): string {
 		return error instanceof Error ? error.message : String(error);
 	}
@@ -363,7 +378,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		state.lastAutoCount = nonEmptyMessages(ctx.sessionManager.getBranch()).length;
 		pi.setSessionName(name);
 		persistState("auto", name);
-		notify(ctx, `Session ${verb}: ${name}`, "info");
+		notifyInTerminal(ctx, `Session ${verb}: ${name}`, "info");
 	}
 
 	function applyManualName(ctx: ExtensionContext, name: string): void {
@@ -375,7 +390,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		state.lastAutoName = name;
 		pi.setSessionName(name);
 		persistState("manual", name);
-		notify(ctx, `Session named: ${name}`, "info");
+		notifyInTerminal(ctx, `Session named: ${name}`, "info");
 	}
 
 	// ---------- automatic naming attempts ----------
@@ -420,7 +435,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 			if (result.reason === "cancelled") return;
 			if (result.error) {
 				state.lastFailTime = Date.now();
-				notify(ctx, `Auto rename skipped: ${result.error}`, "warning");
+				notifyInTerminal(ctx, `Auto rename skipped: ${result.error}`, "warning");
 				return;
 			}
 			if (result.name && !state.manual && !pi.getSessionName()) {
@@ -428,7 +443,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 			}
 		} catch (error) {
 			if (isCurrentRequest(request)) {
-				notify(ctx, `Auto rename failed: ${errMessage(error)}`, "warning");
+				notifyInTerminal(ctx, `Auto rename failed: ${errMessage(error)}`, "warning");
 			}
 		} finally {
 			// Only the owner may release the guard: an old request's finally must
@@ -485,7 +500,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 			if (!isCurrentRequest(request)) return;
 			if (result.reason === "cancelled") return;
 			if (result.error) {
-				notify(ctx, `Continuous rename skipped: ${result.error}`, "warning");
+				notifyInTerminal(ctx, `Continuous rename skipped: ${result.error}`, "warning");
 				return;
 			}
 			const name = result.name;
@@ -498,7 +513,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 			applyAutoName(ctx, name, "renamed");
 		} catch (error) {
 			if (isCurrentRequest(request)) {
-				notify(ctx, `Continuous rename failed: ${errMessage(error)}`, "warning");
+				notifyInTerminal(ctx, `Continuous rename failed: ${errMessage(error)}`, "warning");
 			}
 		} finally {
 			// Only the owner may release the guard: an old request's finally must
@@ -555,7 +570,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 			// empty here, so this is a no-op for them.
 			scheduleFirstNaming(ctx);
 		} catch (error) {
-			notify(ctx, `Auto rename init failed: ${errMessage(error)}`, "warning");
+			notifyInTerminal(ctx, `Auto rename init failed: ${errMessage(error)}`, "warning");
 		}
 	});
 
@@ -614,7 +629,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		try {
 			scheduleFirstNaming(ctx);
 		} catch (error) {
-			notify(ctx, `Auto rename failed: ${errMessage(error)}`, "warning");
+			notifyInTerminal(ctx, `Auto rename failed: ${errMessage(error)}`, "warning");
 		}
 	});
 
@@ -622,7 +637,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		try {
 			scheduleContinuous(ctx);
 		} catch (error) {
-			notify(ctx, `Continuous rename failed: ${errMessage(error)}`, "warning");
+			notifyInTerminal(ctx, `Continuous rename failed: ${errMessage(error)}`, "warning");
 		}
 	});
 

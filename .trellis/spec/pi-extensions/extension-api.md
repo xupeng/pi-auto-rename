@@ -63,7 +63,8 @@ pi.appendEntry(customType: string, data: unknown)
 
 | Condition | Behavior |
 |---|---|
-| `resolveModel` fails / model not found | return `{ error }`; auto path → silent skip + warning notify; manual command → error notify |
+| `resolveModel` fails / model not found | return `{ error }`; auto path → silent skip + warning notify (TUI only); manual command → error notify |
+| Notification in a non-`tui` mode (`ctx.mode`, e.g. pi-web = `rpc`) | naming confirmations and automatic-path warnings are suppressed (`notifyInTerminal`); explicit command errors/config feedback still use `notify` |
 | No API key / provider not configured | the registry throws `Provider is not configured: <provider>` → catch returns `{ error }` → same as above |
 | `complete` stopReason `"error"` / `"aborted"` | return `{ error: errorMessage ?? stopReason }` |
 | Empty / unusable model output | sanitize → `null` → `{ error: "empty title" }` |

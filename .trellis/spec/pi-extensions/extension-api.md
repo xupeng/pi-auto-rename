@@ -65,6 +65,7 @@ pi.appendEntry(customType: string, data: unknown)
 |---|---|
 | `resolveModel` fails / model not found | return `{ error }`; auto path → silent skip + warning notify (TUI only); manual command → error notify |
 | Notification in a non-`tui` mode (`ctx.mode`, e.g. pi-web = `rpc`) | naming confirmations and automatic-path warnings are suppressed (`notifyInTerminal`); explicit command errors/config feedback still use `notify` |
+| User message is an expanded `/skill:` block (`parseSkillBlock` matches) | naming input uses the typed args, or `/skill:<name>` when there are none — never the SKILL.md body |
 | No API key / provider not configured | the registry throws `Provider is not configured: <provider>` → catch returns `{ error }` → same as above |
 | `complete` stopReason `"error"` / `"aborted"` | return `{ error: errorMessage ?? stopReason }` |
 | Empty / unusable model output | sanitize → `null` → `{ error: "empty title" }` |

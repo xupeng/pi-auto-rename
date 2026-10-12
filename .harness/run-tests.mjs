@@ -1752,6 +1752,73 @@ async function t31() {
 }
 
 // =====================================================================
+// T32 — expanded /skill: blocks are reduced to what the user typed
+// =====================================================================
+function skillBlock(name, body, args) {
+  const block = `<skill name="${name}" location="/skills/${name}/SKILL.md">\nReferences are relative to /skills/${name}.\n\n${body}\n</skill>`;
+  return args ? `${block}\n\n${args}` : block;
+}
+
+function promptText(call) {
+  return call?.context?.messages?.[0]?.content?.[0]?.text ?? "";
+}
+
+async function t32() {
+  const body = "SKILLBODY ".repeat(1000);
+  const mod = await import("../index.ts");
+
+  // First naming: the user's words survive, the skill body does not.
+  const pi = makePi({});
+  mod.default(pi);
+  await fire(pi, "session_start");
+  setComplete(okComplete("Cache Layer"));
+  pushMessages(pi, [skillBlock("brainstorming", body, "帮我设计一个缓存层")]);
+  await fire(pi, "message_end");
+  await tick();
+  let text = promptText(globalThis.__ARN__.completeCalls[0]);
+  assert(text.includes("User: 帮我设计一个缓存层"), "T32 first: user arguments kept");
+  assert(!text.includes("SKILLBODY"), "T32 first: skill body dropped");
+  assert(!text.includes("<skill"), "T32 first: skill wrapper dropped");
+
+  // A bare /skill:name keeps only the command the user typed.
+  const bare = makePi({});
+  mod.default(bare);
+  await fire(bare, "session_start");
+  setComplete(okComplete("Brainstorm"));
+  pushMessages(bare, [skillBlock("brainstorming", body)]);
+  await fire(bare, "message_end");
+  await tick();
+  text = promptText(globalThis.__ARN__.completeCalls[1]);
+  assert(text.includes("User: /skill:brainstorming"), "T32 bare: the typed command stands in");
+  assert(!text.includes("SKILLBODY"), "T32 bare: skill body dropped");
+
+  // /rename (AI) history: the body cannot crowd later messages out of the 8000-char cap.
+  const hist = makePi({});
+  mod.default(hist);
+  await fire(hist, "session_start");
+  pushMessages(hist, [
+    skillBlock("brainstorming", body, "设计缓存"),
+    { role: "assistant", text: "好的" },
+    "最后改成用 Redis",
+  ]);
+  setComplete(okComplete("Redis Cache"));
+  await cmd(hist, "rename", "");
+  text = promptText(globalThis.__ARN__.completeCalls.at(-1));
+  assert(!text.includes("SKILLBODY"), "T32 history: skill body dropped");
+  assert(text.includes("最后改成用 Redis"), "T32 history: later messages kept");
+
+  // Assistant text that merely looks like a skill block is left alone.
+  const asst = makePi({});
+  mod.default(asst);
+  await fire(asst, "session_start");
+  setComplete(okComplete("Quoted"));
+  pushMessages(asst, ["hi", { role: "assistant", text: skillBlock("quoted", "ASSISTANT-QUOTE") }]);
+  await cmd(asst, "rename", "");
+  text = promptText(globalThis.__ARN__.completeCalls.at(-1));
+  assert(text.includes("ASSISTANT-QUOTE"), "T32 assistant text untouched");
+}
+
+// =====================================================================
 // runner
 // =====================================================================
 const tests = [
@@ -1788,6 +1855,7 @@ const tests = [
   ["T29 tree navigation preserves file-wide name ownership", t29],
   ["T30 naming notifications are terminal-only", t30],
   ["T31 explicit errors still reported off-terminal; tui unchanged", t31],
+  ["T32 expanded skill blocks reduced to the user's words", t32],
 ];
 
 for (const [name, fn] of tests) {

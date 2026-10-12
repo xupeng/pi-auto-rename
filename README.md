@@ -9,7 +9,8 @@ behavior is configurable and predictable, and it never overwrites a name you set
 
 - **Auto-naming on session start** — names the session once from the first 3 non-empty
   user/assistant messages (4000 chars each). Resumed sessions that have messages but no
-  name get named too.
+  name get named too. A `/skill:name args` message counts as just `args` (or
+  `/skill:name` when there are none) — the expanded SKILL.md never reaches the title prompt.
 - **Never blocks the agent** — automatic naming runs in the background on a
   session-owned cancellation source. Replies, tool calls, and settlement never wait for
   the title request.

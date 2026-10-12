@@ -10,6 +10,19 @@ export function getAgentDir() {
   return join(homedir(), ".pi", "agent");
 }
 
+// Verbatim copy of pi's exported parser (dist/core/agent-session.js), which
+// matches the block _expandSkillCommand() writes for `/skill:name args`.
+export function parseSkillBlock(text) {
+  const match = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
+  if (!match) return null;
+  return {
+    name: match[1],
+    location: match[2],
+    content: match[3],
+    userMessage: match[4]?.trim() || undefined,
+  };
+}
+
 export class DynamicBorder {
   constructor() {}
   render() {

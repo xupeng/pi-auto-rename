@@ -31,11 +31,12 @@
  * All handlers are wrapped in try/catch — the extension never throws.
  */
 
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	SessionEntry,
+import {
+	parseSkillBlock,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
 	defaultConfig,
@@ -319,6 +320,17 @@ export default function autoRename(pi: ExtensionAPI): void {
 			.join("\n");
 	}
 
+	/**
+	 * Undo pi's `/skill:name args` expansion: keep what the user typed instead of
+	 * the SKILL.md body, which would otherwise fill the per-message and history
+	 * budgets and make the title describe the skill.
+	 */
+	function stripSkillExpansion(text: string): string {
+		const skill = parseSkillBlock(text);
+		if (!skill) return text;
+		return skill.userMessage ?? `/skill:${skill.name}`;
+	}
+
 	function nonEmptyMessages(entries: readonly SessionEntry[]): MessageText[] {
 		const out: MessageText[] = [];
 		for (const entry of entries) {
@@ -326,7 +338,8 @@ export default function autoRename(pi: ExtensionAPI): void {
 			const message = entry.message;
 			if (!message) continue;
 			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = extractTextFromContent(message.content).trim();
+			let text = extractTextFromContent(message.content).trim();
+			if (message.role === "user") text = stripSkillExpansion(text);
 			if (!text) continue;
 			out.push({ role: message.role, text });
 		}

@@ -768,6 +768,7 @@ async function t9() {
   assertEq(cfg.continuousRename, false, "T9 missing continuousRename defaults to false");
   assertEq(cfg.language, "auto", "T9 missing language defaults to auto");
   assertEq(cfg.model, undefined, "T9 absent model override stays undefined");
+  assertEq(JSON.stringify(cfg.models), "[]", "T9 absent model override normalizes models to []");
 }
 
 // =====================================================================
@@ -784,7 +785,7 @@ async function t10() {
   await fire(pi, "message_end");
   await tick();
   const call = globalThis.__ARN__.completeCalls[0];
-  assertEq(call.options.maxTokens, 64, "T10 maxTokens = 64");
+  assertEq(call.options.maxTokens, 128, "T10 maxTokens = 128");
   assert(!!call.options.signal, "T10 abort signal forwarded");
   assertEq(call.options.apiKey, undefined, "T10 extension does not pass apiKey — the registry resolves auth");
   assertEq(call.options.headers, undefined, "T10 extension does not pass headers — the registry resolves auth");
@@ -1819,6 +1820,309 @@ async function t32() {
 }
 
 // =====================================================================
+// T33 — config normalization: single string/object, ordered array, dedup, round-trip
+// =====================================================================
+async function t33() {
+  const { loadConfig, saveConfig, parseModelRefs, formatConfigSummary } = await import("../config.ts");
+
+  // Single string form `"provider/id"`
+  writeConfig({ model: "faux/model-a" });
+  let cfg = loadConfig();
+  assertEq(JSON.stringify(cfg.models), JSON.stringify([{ provider: "faux", id: "model-a" }]), "T33 single string normalized");
+
+  // Ordered mixed array with whitespace + duplicates
+  writeConfig({
+    model: ["  faux/model-a ", { provider: "cliproxy", id: "codex-model" }, "faux/model-a", "bad-entry", "nokey/model-b"],
+  });
+  cfg = loadConfig();
+  assertEq(
+    JSON.stringify(cfg.models),
+    JSON.stringify([
+      { provider: "faux", id: "model-a" },
+      { provider: "cliproxy", id: "codex-model" },
+      { provider: "nokey", id: "model-b" },
+    ]),
+    "T33 mixed array normalized, deduplicated in order",
+  );
+  assert(formatConfigSummary(cfg).includes("faux/model-a → cliproxy/codex-model → nokey/model-b"), "T33 summary displays ordered chain");
+
+  // Persisting single vs multi vs empty
+  saveConfig({ ...cfg, models: [{ provider: "faux", id: "model-a" }] });
+  assertEq(JSON.stringify(readConfigFile().model), JSON.stringify({ provider: "faux", id: "model-a" }), "T33 single model saved as object");
+  saveConfig({ ...cfg, models: [{ provider: "faux", id: "model-a" }, { provider: "faux", id: "model-b" }] });
+  assertEq(
+    JSON.stringify(readConfigFile().model),
+    JSON.stringify([{ provider: "faux", id: "model-a" }, { provider: "faux", id: "model-b" }]),
+    "T33 multi model saved as array",
+  );
+  assertEq(readConfigFile().models, undefined, "T33 disk file does not duplicate `models` key");
+  saveConfig({ ...cfg, models: [] });
+  assertEq(readConfigFile().model, undefined, "T33 empty models omits `model` on disk");
+
+  // parseModelRefs
+  assertEq(
+    JSON.stringify(parseModelRefs("faux/model-a, cliproxy/codex-model , faux/model-a")),
+    JSON.stringify([{ provider: "faux", id: "model-a" }, { provider: "cliproxy", id: "codex-model" }]),
+    "T33 parseModelRefs trims & dedupes",
+  );
+  assertEq(parseModelRefs("faux/model-a,"), null, "T33 trailing comma rejected");
+  assertEq(parseModelRefs("bad"), null, "T33 missing slash rejected");
+}
+
+// =====================================================================
+// T34 — fallback chain execution, billing safety, cancellation & explicit boundary
+// =====================================================================
+async function t34() {
+  const { generateName } = await import("../naming.ts");
+
+  // 1. Missing model -> auth failure -> error stopReason -> timeout -> 5th ok
+  {
+    const pi = makePi({ sessionModel: MODELS.faux["model-a"] });
+    const ctx = makeCtx(pi);
+    const seen = [];
+    setComplete(async (model, _ctx, opts) => {
+      seen.push(`${model.provider}/${model.id}`);
+      if (model.provider === "cliproxy") return { stopReason: "error", errorMessage: "503 unavailable", content: [] };
+      if (model.id === "model-a") {
+        return await new Promise((_res, rej) => {
+          opts.signal.addEventListener("abort", () => rej(new DOMException("Aborted", "AbortError")), { once: true });
+        });
+      }
+      return okComplete("Fallback Title")();
+    });
+    const cfg = {
+      models: [
+        { provider: "missing", id: "x" },
+        { provider: "nokey", id: "model-b" },
+        { provider: "cliproxy", id: "codex-model" },
+        { provider: "faux", id: "model-a" },
+        { provider: "faux", id: "model-b" },
+      ],
+      style: "concise",
+      autoRename: true,
+      continuousRename: false,
+      language: "auto",
+    };
+    const p = generateName(ctx, cfg, "first", "hello");
+    await tick();
+    // model-a hangs -> fire its 30s timeout -> falls back to model-b
+    clock.now += 30_000;
+    fireAllTimers();
+    const res = await p;
+    assertEq(res.name, "Fallback Title", "T34 fell back past missing/auth/error/timeout to model-b");
+    assertEq(
+      JSON.stringify(seen),
+      JSON.stringify(["cliproxy/codex-model", "faux/model-a", "faux/model-b"]),
+      "T34 called candidates in exact order",
+    );
+    assertEq(pendingTimerCount(), 0, "T34 cleaned up per-candidate timers");
+  }
+
+  // 2. Valid empty response (`stopReason: "stop"`) MUST NOT retry next candidate
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    const seen = [];
+    setComplete(async (model) => {
+      seen.push(`${model.provider}/${model.id}`);
+      return okComplete("   ")();
+    });
+    const cfg = {
+      models: [{ provider: "faux", id: "model-a" }, { provider: "faux", id: "model-b" }],
+      style: "concise",
+      autoRename: true,
+      continuousRename: false,
+      language: "auto",
+    };
+    const res = await generateName(ctx, cfg, "first", "hello");
+    assertEq(res.error, "Naming model returned an empty title", "T34 empty valid reply reports empty error");
+    assertEq(JSON.stringify(seen), JSON.stringify(["faux/model-a"]), "T34 valid empty reply did not double-bill backup");
+  }
+
+  // 3. External abort immediately cancels without touching backup candidate
+  {
+    const pi = makePi({});
+    const ctx = makeCtx(pi);
+    const seen = [];
+    const ext = new AbortController();
+    setComplete((model) => {
+      seen.push(`${model.provider}/${model.id}`);
+      return new Promise(() => {});
+    });
+    const cfg = {
+      models: [{ provider: "faux", id: "model-a" }, { provider: "faux", id: "model-b" }],
+      style: "concise",
+      autoRename: true,
+      continuousRename: false,
+      language: "auto",
+    };
+    const p = generateName(ctx, cfg, "first", "hello", { signal: ext.signal });
+    await tick();
+    ext.abort();
+    const res = await p;
+    assertEq(res.reason, "cancelled", "T34 external abort returned cancelled");
+    assertEq(JSON.stringify(seen), JSON.stringify(["faux/model-a"]), "T34 cancelled before touching backup");
+  }
+
+  // 4. Explicit override all-failed NEVER falls back to session model
+  {
+    const pi = makePi({ sessionModel: MODELS.faux["model-a"] });
+    const ctx = makeCtx(pi);
+    const seen = [];
+    setComplete(async (model) => {
+      seen.push(`${model.provider}/${model.id}`);
+      return okComplete("Should Not Reach Session Model")();
+    });
+    const cfg = {
+      models: [{ provider: "missing", id: "x" }, { provider: "nokey", id: "model-b" }],
+      style: "concise",
+      autoRename: true,
+      continuousRename: false,
+      language: "auto",
+    };
+    const res = await generateName(ctx, cfg, "first", "hello");
+    assert(!!res.error && res.error.includes("missing/x") && res.error.includes("nokey/model-b"), "T34 aggregated all-fail error");
+    assertEq(seen.length, 0, "T34 explicit override never fell back to session model");
+  }
+}
+
+// =====================================================================
+// T35 — streamSimple preference + minimal reasoning for reasoning models
+// =====================================================================
+async function t35() {
+  const { generateName } = await import("../naming.ts");
+  const pi = makePi({});
+  const baseCtx = makeCtx(pi);
+  const streamCalls = [];
+  const reasoningModel = { provider: "faux", id: "reasoner", reasoning: true };
+  const plainModel = { provider: "faux", id: "plain", reasoning: false };
+  const ctx = {
+    ...baseCtx,
+    modelRegistry: {
+      ...baseCtx.modelRegistry,
+      find: (p, id) => {
+        if (p === "faux" && id === "reasoner") return reasoningModel;
+        if (p === "faux" && id === "plain") return plainModel;
+        return null;
+      },
+      streamSimple: (model, context, options) => {
+        streamCalls.push({ model, context, options });
+        return {
+          result: async () => {
+            if (model.id === "reasoner") {
+              return { stopReason: "error", errorMessage: "rate limited", content: [] };
+            }
+            return { stopReason: "stop", content: [{ type: "text", text: "Stream Title" }] };
+          },
+        };
+      },
+    },
+  };
+  const cfg = {
+    models: [{ provider: "faux", id: "reasoner" }, { provider: "faux", id: "plain" }],
+    style: "concise",
+    autoRename: true,
+    continuousRename: false,
+    language: "auto",
+  };
+  const res = await generateName(ctx, cfg, "first", "hello");
+  assertEq(res.name, "Stream Title", "T35 streamSimple fell back from reasoner to plain");
+  assertEq(streamCalls.length, 2, "T35 streamSimple called twice");
+  assertEq(streamCalls[0].options.maxTokens, 128, "T35 maxTokens = 128");
+  assertEq(streamCalls[0].options.reasoning, "minimal", "T35 reasoning model receives reasoning: minimal");
+  assertEq(streamCalls[1].options.reasoning, undefined, "T35 non-reasoning model omits reasoning option");
+  assertEq(globalThis.__ARN__.completeCalls.length, 0, "T35 did not call complete when streamSimple existed");
+}
+
+// =====================================================================
+// T36 — /rename-config model CLI multi-model, completions, and interactive submenu
+// =====================================================================
+async function t36() {
+  const pi = makePi({});
+  const mod = await import("../index.ts");
+  mod.default(pi);
+  await fire(pi, "session_start");
+
+  // Comma-separated CLI set + persistence
+  await cmd(pi, "rename-config", "model faux/model-b,cliproxy/codex-model,faux/model-b");
+  assertEq(
+    JSON.stringify(readConfigFile().model),
+    JSON.stringify([{ provider: "faux", id: "model-b" }, { provider: "cliproxy", id: "codex-model" }]),
+    "T36 CLI persisted ordered model chain",
+  );
+  assert(
+    pi.notifications.some((n) => n.message.includes("faux/model-b → cliproxy/codex-model")),
+    "T36 CLI notified ordered model chain",
+  );
+
+  // Unknown model in chain rejected without mutating saved chain
+  await cmd(pi, "rename-config", "model faux/model-a,missing/nope");
+  assertEq(
+    JSON.stringify(readConfigFile().model),
+    JSON.stringify([{ provider: "faux", id: "model-b" }, { provider: "cliproxy", id: "codex-model" }]),
+    "T36 unknown candidate rejected without overwriting config",
+  );
+
+  // Comma completion suggests remaining models
+  const rc = pi.commands.get("rename-config");
+  const nextVals = rc.getArgumentCompletions("model faux/model-a,");
+  assert(nextVals && nextVals.some((v) => v.value === "faux/model-a,faux/model-b"), "T36 comma completion offers remaining model");
+  assert(nextVals && !nextVals.some((v) => v.value === "faux/model-a,faux/model-a"), "T36 comma completion excludes already-picked model");
+  assert(nextVals && !nextVals.some((v) => v.label === "none"), "T36 comma completion excludes none after comma");
+
+  // Reset via `none`
+  await cmd(pi, "rename-config", "model none");
+  assertEq(readConfigFile().model, undefined, "T36 model none cleared config");
+
+  // Interactive configureModels submenu (set-primary + add-fallback + remove + clear) & runInteractiveConfig show
+  const { configureModels, runInteractiveConfig } = await import("../ui-config.ts");
+  let memCfg = { models: [], style: "concise", autoRename: true, continuousRename: false, language: "auto" };
+  const actions = ["set-primary", "faux/model-a", "add-fallback", "faux/model-b", "done"];
+  const customCtx = {
+    ...makeCtx(pi),
+    ui: {
+      notify: (m, l) => pi.notifications.push({ message: m, level: l }),
+      custom: async () => actions.shift() ?? "done",
+    },
+  };
+  const uiDeps = {
+    getConfig: () => memCfg,
+    applyConfig: (patch) => {
+      memCfg = { ...memCfg, ...patch };
+    },
+    collectModelRefs: () => ["faux/model-a", "faux/model-b"],
+    resetConfig: () => true,
+    notify: (m, l) => pi.notifications.push({ message: m, level: l }),
+  };
+  await configureModels(customCtx, uiDeps);
+  assertEq(
+    JSON.stringify(memCfg.models),
+    JSON.stringify([{ provider: "faux", id: "model-a" }, { provider: "faux", id: "model-b" }]),
+    "T36 interactive set-primary + add-fallback built chain",
+  );
+  const selectTitles = [];
+  const mainChoices = ["show", "done"];
+  await runInteractiveConfig(
+    {
+      ...customCtx,
+      ui: {
+        ...customCtx.ui,
+        select: async (title) => {
+          selectTitles.push(title);
+          return mainChoices.shift() ?? "done";
+        },
+      },
+    },
+    uiDeps,
+  );
+  assert(selectTitles[0]?.includes("faux/model-a → faux/model-b"), "T36 interactive main menu displays full chain");
+  assert(pi.notifications.some((n) => n.message.includes("Model chain: 1. faux/model-a → 2. faux/model-b")), "T36 show displays numbered model chain");
+  actions.push("remove", "0", "clear", "done");
+  await configureModels(customCtx, uiDeps);
+  assertEq(memCfg.models.length, 0, "T36 interactive remove + clear emptied model list");
+}
+
+// =====================================================================
 // runner
 // =====================================================================
 const tests = [
@@ -1856,6 +2160,10 @@ const tests = [
   ["T30 naming notifications are terminal-only", t30],
   ["T31 explicit errors still reported off-terminal; tui unchanged", t31],
   ["T32 expanded skill blocks reduced to the user's words", t32],
+  ["T33 config normalization: single/array, dedup, round-trip", t33],
+  ["T34 fallback chain, billing safety, cancellation & explicit boundary", t34],
+  ["T35 streamSimple preference + minimal reasoning", t35],
+  ["T36 /rename-config multi-model CLI, completions & interactive menu", t36],
 ];
 
 for (const [name, fn] of tests) {

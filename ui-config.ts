@@ -3,9 +3,10 @@
  *
  * Mirrors pi-image's interactive config UX: a main menu whose entries lead
  * to per-item pickers, including a searchable model picker (Input + SelectList
- * with substring filtering). Argument-driven subcommands (/rename-config model
- * provider/id, style concise, ...) remain the fast path and the UI-less
- * fallback; this module only runs when ctx.hasUI is true.
+ * with substring filtering) that supports primary + ordered fallback models.
+ * Argument-driven subcommands (/rename-config model a/1,b/2, style concise, ...)
+ * remain the fast path and the UI-less fallback; this module only runs when
+ * ctx.hasUI is true.
  */
 
 import { DynamicBorder, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -19,8 +20,14 @@ import {
 } from "@earendil-works/pi-tui";
 import {
 	CONFIG_FILE_PATH,
+	formatConfigSummary,
+	formatModelRef,
+	formatModelRefs,
+	getConfiguredModels,
+	parseModelRef,
 	type RenameConfig,
 	type RenameLanguage,
+	type RenameModelRef,
 	type RenameStyle,
 } from "./config.ts";
 
@@ -150,13 +157,103 @@ function pickModel(
 	});
 }
 
-function summarize(config: RenameConfig): string {
-	const model = config.model ? `${config.model.provider}/${config.model.id}` : "follow session model";
-	const custom = config.style === "custom" ? ` (${config.customStyle ?? ""})` : "";
-	return (
-		`model: ${model}; style: ${config.style}${custom}; auto: ${config.autoRename ? "on" : "off"}; ` +
-		`continuous: ${config.continuousRename ? "on" : "off"}; language: ${config.language}`
-	);
+function summarizeModels(models: readonly RenameModelRef[]): string {
+	if (models.length === 0) return "follow session model";
+	return models.map((model, index) => `${index + 1}. ${formatModelRef(model)}`).join(" → ");
+}
+
+/** Interactive submenu to inspect and edit the ordered model chain (primary + fallbacks). */
+export async function configureModels(ctx: ExtensionCommandContext, deps: ConfigUiDeps): Promise<void> {
+	while (true) {
+		const current = getConfiguredModels(deps.getConfig());
+		const items: SelectItem[] = [
+			{
+				value: "set-primary",
+				label: current.length > 0 ? "Set primary model (replace list)" : "Set primary model",
+			},
+			{
+				value: "add-fallback",
+				label: current.length > 0 ? "Add fallback model" : "Add model to chain",
+			},
+			...(current.length > 0
+				? [
+						{ value: "remove", label: "Remove a model from chain" },
+						{ value: "clear", label: "Clear override (follow session model)" },
+					]
+				: []),
+			{ value: "done", label: "Back" },
+		];
+		const action = await pickOne<"set-primary" | "add-fallback" | "remove" | "clear" | "done">(
+			ctx,
+			`Rename models — ${summarizeModels(current)}`,
+			items,
+		);
+		if (!action || action === "done") return;
+
+		switch (action) {
+		case "set-primary": {
+			const refs = deps.collectModelRefs();
+			if (refs.length === 0) {
+				deps.notify("No models with configured auth are available.", "warning");
+				break;
+			}
+			const selected = await pickModel(ctx, "Select primary rename model:", [...refs, "none"]);
+			if (selected === null) break;
+			if (selected === "none") {
+				deps.applyConfig({ models: [] }, "Rename model cleared (follows session model)");
+			} else {
+				const ref = parseModelRef(selected);
+				if (ref) deps.applyConfig({ models: [ref] }, `Rename model set to ${selected}`);
+			}
+			break;
+		}
+		case "add-fallback": {
+			const refs = deps.collectModelRefs();
+			if (refs.length === 0) {
+				deps.notify("No models with configured auth are available.", "warning");
+				break;
+			}
+			const existing = new Set(current.map(formatModelRef));
+			const candidates = refs.filter((ref) => !existing.has(ref));
+			if (candidates.length === 0) {
+				deps.notify("All available models are already in the chain.", "info");
+				break;
+			}
+			const selected = await pickModel(ctx, "Add fallback rename model:", candidates);
+			if (!selected) break;
+			const ref = parseModelRef(selected);
+			if (ref) {
+				const next = [...current, ref];
+				deps.applyConfig({ models: next }, `Rename models set to ${formatModelRefs(next)}`);
+			}
+			break;
+		}
+		case "remove": {
+			const indexStr = await pickOne<string>(
+				ctx,
+				"Remove model from chain:",
+				current.map((model, index) => ({
+					value: String(index),
+					label: `${index + 1}. ${formatModelRef(model)}`,
+				})),
+			);
+			if (indexStr === null) break;
+			const index = Number(indexStr);
+			const next = current.filter((_, i) => i !== index);
+			deps.applyConfig(
+				{ models: next },
+				next.length === 0
+					? "Rename model cleared (follows session model)"
+					: `Rename models set to ${formatModelRefs(next)}`,
+			);
+			break;
+		}
+		case "clear": {
+			deps.applyConfig({ models: [] }, "Rename model cleared (follows session model)");
+			break;
+		}
+		}
+	}
 }
 
 /**
@@ -173,36 +270,14 @@ export async function runInteractiveConfig(
 ): Promise<void> {
 	while (true) {
 		const choice = await ctx.ui.select(
-			`Rename config — ${summarize(deps.getConfig())}`,
+			`Rename config — ${formatConfigSummary(deps.getConfig())}`,
 			["model", "style", "auto", "continuous", "language", "show", "reset", "done"],
 		);
 		if (!choice || choice === "done") return;
 
 		switch (choice) {
 		case "model": {
-			const refs = deps.collectModelRefs();
-			if (refs.length === 0) {
-				deps.notify("No models with configured auth are available.", "warning");
-				break;
-			}
-			const selected = await pickModel(ctx, "Select rename model:", [...refs, "none"]);
-			if (selected === null) break;
-			if (selected === "none") {
-				deps.applyConfig({ model: undefined }, "Rename model cleared (follows session model)");
-			} else {
-				const slash = selected.indexOf("/");
-				if (slash > 0) {
-					deps.applyConfig(
-						{
-							model: {
-								provider: selected.slice(0, slash),
-								id: selected.slice(slash + 1),
-							},
-						},
-						`Rename model set to ${selected}`,
-					);
-				}
-			}
+			await configureModels(ctx, deps);
 			break;
 		}
 		case "style": {
@@ -257,7 +332,12 @@ export async function runInteractiveConfig(
 			break;
 		}
 		case "show": {
-			deps.notify(`Rename config — ${summarize(deps.getConfig())}`, "info");
+			const current = deps.getConfig();
+			deps.notify(`Rename config — ${formatConfigSummary(current)}`, "info");
+			const models = getConfiguredModels(current);
+			if (models.length > 0) {
+				deps.notify(`Model chain: ${summarizeModels(models)}`, "info");
+			}
 			deps.notify(`Config file: ${CONFIG_FILE_PATH}`, "info");
 			break;
 		}

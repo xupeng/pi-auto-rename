@@ -2,8 +2,10 @@
  * pi-auto-rename — global configuration.
  *
  * Reads/writes <agentDir>/pi-auto-rename.json (~/.pi/agent/pi-auto-rename.json)
- * with the full RenameConfig structure. Any read/parse failure falls back to
- * defaults so the extension stays zero-config out of the box.
+ * with the normalized RenameConfig structure. On disk, `model` accepts either a
+ * single `{ provider, id }` / `"provider/id"` or an ordered array of them for
+ * fallback. Any read/parse failure falls back to defaults so the extension
+ * stays zero-config out of the box.
  */
 
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -19,7 +21,11 @@ export interface RenameModelRef {
 }
 
 export interface RenameConfig {
-	/** Naming model override; undefined means "follow the session's current model". */
+	/**
+	 * Ordered naming model overrides. Empty means "follow the session's current model".
+	 */
+	models: RenameModelRef[];
+	/** Legacy single-model override accepted when callers pass ad-hoc config objects. */
 	model?: RenameModelRef;
 	/** Naming style. Default "concise". */
 	style: RenameStyle;
@@ -41,6 +47,7 @@ const LANGUAGES: readonly RenameLanguage[] = ["auto", "zh", "en"];
 
 export function defaultConfig(): RenameConfig {
 	return {
+		models: [],
 		style: "concise",
 		autoRename: true,
 		continuousRename: false,
@@ -52,7 +59,77 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function normalizeModelRef(value: unknown): RenameModelRef | undefined {
+/** Parse `"provider/id"` (allowing slashes inside `id`, e.g. `"openrouter/org/model"`). */
+export function parseModelRef(value: string): RenameModelRef | null {
+	const input = value.trim();
+	const slashIndex = input.indexOf("/");
+	if (slashIndex <= 0 || slashIndex >= input.length - 1) return null;
+	const rawProvider = input.slice(0, slashIndex);
+	const rawId = input.slice(slashIndex + 1);
+	const provider = rawProvider.trim();
+	const id = rawId.trim();
+	if (!provider || !id || provider !== rawProvider || id !== rawId) return null;
+	return { provider, id };
+}
+
+/** Parse comma-separated `"provider/id,provider2/id2"` into a deduplicated list; null on any invalid entry. */
+export function parseModelRefs(value: string): RenameModelRef[] | null {
+	const parts = value.split(",");
+	const refs: RenameModelRef[] = [];
+	for (const part of parts) {
+		const ref = parseModelRef(part);
+		if (!ref) return null;
+		refs.push(ref);
+	}
+	return dedupeModelRefs(refs);
+}
+
+export function formatModelRef(ref: RenameModelRef): string {
+	return `${ref.provider}/${ref.id}`;
+}
+
+export function formatModelRefs(models?: readonly RenameModelRef[]): string {
+	if (!models || models.length === 0) return "follow session model";
+	return models.map(formatModelRef).join(" → ");
+}
+
+export function getConfiguredModels(config: Pick<RenameConfig, "models" | "model">): RenameModelRef[] {
+	if (Array.isArray(config.models) && config.models.length > 0) {
+		return dedupeModelRefs(config.models);
+	}
+	if (config.model) {
+		const single = normalizeSingleModelRef(config.model);
+		return single ? [single] : [];
+	}
+	return [];
+}
+
+export function formatConfigSummary(config: RenameConfig): string {
+	const models = getConfiguredModels(config);
+	const model = formatModelRefs(models);
+	const custom = config.style === "custom" ? ` (${config.customStyle ?? ""})` : "";
+	return (
+		`model: ${model}; style: ${config.style}${custom}; auto: ${config.autoRename ? "on" : "off"}; ` +
+		`continuous: ${config.continuousRename ? "on" : "off"}; language: ${config.language}`
+	);
+}
+
+export function dedupeModelRefs(refs: readonly RenameModelRef[]): RenameModelRef[] {
+	const out: RenameModelRef[] = [];
+	const seen = new Set<string>();
+	for (const ref of refs) {
+		const key = formatModelRef(ref);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push({ provider: ref.provider, id: ref.id });
+	}
+	return out;
+}
+
+function normalizeSingleModelRef(value: unknown): RenameModelRef | undefined {
+	if (typeof value === "string") {
+		return parseModelRef(value) ?? undefined;
+	}
 	if (!isRecord(value)) return undefined;
 	const { provider, id } = value;
 	if (typeof provider !== "string" || typeof id !== "string") return undefined;
@@ -62,13 +139,25 @@ function normalizeModelRef(value: unknown): RenameModelRef | undefined {
 	return { provider: normalizedProvider, id: normalizedId };
 }
 
+function normalizeModelRefs(value: unknown): RenameModelRef[] {
+	if (Array.isArray(value)) {
+		const refs: RenameModelRef[] = [];
+		for (const item of value) {
+			const normalized = normalizeSingleModelRef(item);
+			if (normalized) refs.push(normalized);
+		}
+		return dedupeModelRefs(refs);
+	}
+	const single = normalizeSingleModelRef(value);
+	return single ? [single] : [];
+}
+
 function normalizeConfig(data: unknown): RenameConfig {
 	const base = defaultConfig();
 	if (!isRecord(data)) return base;
 
-	const out: RenameConfig = { ...base };
-	const model = normalizeModelRef(data.model);
-	if (model) out.model = model;
+	const out: RenameConfig = { ...base, models: [] };
+	out.models = normalizeModelRefs(data.model);
 	if (typeof data.style === "string" && (STYLES as readonly string[]).includes(data.style)) {
 		out.style = data.style as RenameStyle;
 	}
@@ -99,8 +188,17 @@ export function loadConfig(): RenameConfig {
 /** Persist the config. Returns false on failure (caller keeps memory config). */
 export function saveConfig(config: RenameConfig): boolean {
 	try {
+		const models = getConfiguredModels(config);
+		const persisted: Record<string, unknown> = {
+			...(models.length === 1 ? { model: models[0] } : models.length > 1 ? { model: models } : {}),
+			style: config.style,
+			...(config.customStyle ? { customStyle: config.customStyle } : {}),
+			autoRename: config.autoRename,
+			continuousRename: config.continuousRename,
+			language: config.language,
+		};
 		mkdirSync(dirname(CONFIG_FILE_PATH), { recursive: true });
-		writeFileSync(CONFIG_FILE_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+		writeFileSync(CONFIG_FILE_PATH, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
 		return true;
 	} catch {
 		return false;

@@ -41,7 +41,12 @@ import {
 import {
 	defaultConfig,
 	CONFIG_FILE_PATH,
+	formatConfigSummary,
+	formatModelRef,
+	formatModelRefs,
+	getConfiguredModels,
 	loadConfig,
+	parseModelRefs,
 	resetConfigFile,
 	saveConfig,
 	type RenameConfig,
@@ -50,7 +55,7 @@ import {
 } from "./config.ts";
 import { readState, writeState, type RenameSource } from "./state.ts";
 import { generateName } from "./naming.ts";
-import { runInteractiveConfig } from "./ui-config.ts";
+import { type ConfigUiDeps, configureModels, runInteractiveConfig } from "./ui-config.ts";
 
 const CONTINUOUS_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const CONTINUOUS_MIN_NEW_MESSAGES = 3;
@@ -295,14 +300,11 @@ export default function autoRename(pi: ExtensionAPI): void {
 		return [...new Set(models.map((model) => `${model.provider}/${model.id}`))].sort();
 	}
 
-	function parseModelRef(value: string): { provider: string; id: string } | null {
-		const input = value.trim();
-		const slashIndex = input.indexOf("/");
-		if (slashIndex <= 0 || slashIndex === input.length - 1) return null;
-		const provider = input.slice(0, slashIndex).trim();
-		const id = input.slice(slashIndex + 1).trim();
-		if (!provider || !id) return null;
-		return { provider, id };
+	function snapshotConfig(): RenameConfig {
+		return {
+			...config,
+			models: [...config.models],
+		};
 	}
 
 	// ---------- session text helpers ----------
@@ -423,7 +425,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		if (!input) return;
 
 		// Capture configuration and input before a context replacement can occur.
-		const configSnapshot: RenameConfig = { ...config };
+		const configSnapshot = snapshotConfig();
 		const request = reserveAutomaticRequest("first");
 		if (!request) return;
 		queueMicrotask(() => {
@@ -486,7 +488,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		const input = recentMessages(ctx.sessionManager.getBranch());
 		if (!input) return;
 
-		const configSnapshot: RenameConfig = { ...config };
+		const configSnapshot = snapshotConfig();
 		const request = reserveAutomaticRequest("continuous", currentName);
 		if (!request) return;
 		queueMicrotask(() => {
@@ -708,53 +710,70 @@ export default function autoRename(pi: ExtensionAPI): void {
 
 	// ---------- /rename-config command ----------
 
+	function makeUiDeps(ctx: ExtensionCommandContext): ConfigUiDeps {
+		return {
+			getConfig: () => config,
+			applyConfig: (patch, summary) => {
+				Object.assign(config, patch);
+				if (patch.models) config.models = [...patch.models];
+				persistConfig(ctx, summary);
+			},
+			collectModelRefs: () => collectModelRefs(ctx),
+			resetConfig: () => {
+				config = defaultConfig();
+				enforceModeInvalidation();
+				return resetConfigFile();
+			},
+			notify: (message, level) => notify(ctx, message, level),
+		};
+	}
+
 	function showConfig(ctx: ExtensionCommandContext): void {
-		const model = config.model ? `${config.model.provider}/${config.model.id}` : "follow session model";
-		const custom = config.style === "custom" ? ` (${config.customStyle ?? ""})` : "";
-		notify(
-			ctx,
-			`Rename config — model: ${model}; style: ${config.style}${custom}; auto: ${config.autoRename ? "on" : "off"}; ` +
-				`continuous: ${config.continuousRename ? "on" : "off"}; language: ${config.language}`,
-			"info",
-		);
+		notify(ctx, `Rename config — ${formatConfigSummary(config)}`, "info");
+		const models = getConfiguredModels(config);
+		if (models.length > 1) {
+			notify(
+				ctx,
+				`Model chain: ${models.map((m, idx) => `${idx + 1}. ${formatModelRef(m)}`).join(" → ")}`,
+				"info",
+			);
+		}
 		notify(ctx, `Config file: ${CONFIG_FILE_PATH}`, "info");
 	}
 
 	async function handleModelConfig(value: string, ctx: ExtensionCommandContext): Promise<void> {
 		if (!value) {
 			if (!ctx.hasUI) {
-				notify(ctx, "No interactive UI available. Use /rename-config model provider/id (or none)", "warning");
+				notify(ctx, "No interactive UI available. Use /rename-config model provider/id[,provider/id...] (or none)", "warning");
 				return;
 			}
-			const refs = collectModelRefs(ctx);
-			if (refs.length === 0) {
-				notify(ctx, "No models with configured auth are available.", "warning");
-				return;
-			}
-			const selected = await ctx.ui.select("Select rename model:", refs);
-			if (!selected) return;
-			config.model = parseModelRef(selected) ?? undefined;
-			persistConfig(ctx, `Rename model set to ${selected}`);
+			await configureModels(ctx, makeUiDeps(ctx));
 			return;
 		}
 
 		if (value === "none") {
-			config.model = undefined;
+			config.models = [];
 			persistConfig(ctx, "Rename model cleared (follows session model)");
 			return;
 		}
 
-		const ref = parseModelRef(value);
-		if (!ref) {
-			notify(ctx, "Invalid model. Usage: /rename-config model provider/id (or none)", "warning");
+		const refs = parseModelRefs(value);
+		if (!refs || refs.length === 0) {
+			notify(ctx, "Invalid model. Usage: /rename-config model provider/id[,provider/id...] (or none)", "warning");
 			return;
 		}
-		if (!ctx.modelRegistry.find(ref.provider, ref.id)) {
-			notify(ctx, `Model not found: ${ref.provider}/${ref.id}`, "warning");
+		const missing = refs.filter((ref) => !ctx.modelRegistry.find(ref.provider, ref.id));
+		if (missing.length > 0) {
+			notify(ctx, `Model not found: ${missing.map(formatModelRef).join(", ")}`, "warning");
 			return;
 		}
-		config.model = ref;
-		persistConfig(ctx, `Rename model set to ${ref.provider}/${ref.id}`);
+		config.models = refs;
+		persistConfig(
+			ctx,
+			refs.length === 1
+				? `Rename model set to ${formatModelRef(refs[0]!)}`
+				: `Rename models set to ${formatModelRefs(refs)}`,
+		);
 	}
 
 	function handleStyleConfig(parts: string[], ctx: ExtensionCommandContext): void {
@@ -810,20 +829,7 @@ export default function autoRename(pi: ExtensionAPI): void {
 		const trimmed = args.trim();
 		if (!trimmed) {
 			if (ctx.hasUI) {
-				await runInteractiveConfig(ctx, {
-					getConfig: () => config,
-					applyConfig: (patch, summary) => {
-						Object.assign(config, patch);
-						persistConfig(ctx, summary);
-					},
-					collectModelRefs: () => collectModelRefs(ctx),
-					resetConfig: () => {
-						config = defaultConfig();
-						enforceModeInvalidation();
-						return resetConfigFile();
-					},
-					notify: (message, level) => notify(ctx, message, level),
-				});
+				await runInteractiveConfig(ctx, makeUiDeps(ctx));
 			} else {
 				showConfig(ctx);
 				notify(
@@ -874,9 +880,23 @@ export default function autoRename(pi: ExtensionAPI): void {
 
 		let candidates: readonly string[];
 		switch (sub) {
-			case "model":
+			case "model": {
+				const comma = rest.lastIndexOf(",");
+				if (comma >= 0) {
+					const head = rest.slice(0, comma + 1);
+					const tail = rest.slice(comma + 1).trimStart();
+					const chosen = new Set(
+						head
+							.split(",")
+							.map((part) => part.trim())
+							.filter(Boolean),
+					);
+					const matches = modelRefs.filter((item) => !chosen.has(item) && item.startsWith(tail));
+					return matches.length > 0 ? matches.map((item) => ({ value: `${head}${item}`, label: item })) : null;
+				}
 				candidates = [...modelRefs, "none"];
 				break;
+			}
 			case "style":
 				candidates = STYLE_VALUES;
 				break;

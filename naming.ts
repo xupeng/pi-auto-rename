@@ -1,29 +1,33 @@
 /**
  * pi-auto-rename — naming core.
  *
- * Resolves the naming model (config override, or the session's current model),
- * builds system/user prompts for the three naming kinds (first / history /
- * update), calls the AI through ctx.modelRegistry.complete(), and sanitizes the
- * raw output into a short title. All failures are returned as { error } — never
- * thrown.
+ * Resolves the naming model chain (config override list, or the session's
+ * current model when unconfigured), builds system/user prompts for the three
+ * naming kinds (first / history / update), calls the AI through
+ * ctx.modelRegistry.streamSimple() (passing `reasoning: "minimal"` for
+ * reasoning models so thinking cannot exhaust the token budget, and falling
+ * back to ctx.modelRegistry.complete() when a mock/older registry lacks
+ * streamSimple), and sanitizes the raw output into a short title. All failures
+ * are returned as { error } — never thrown.
  *
- * Why the registry and not @earendil-works/pi-ai/compat: compat's complete()
- * dispatches on pi-ai's global api registry, which only knows builtin api ids.
- * A provider registered by another extension (`registerProvider({ api,
- * streamSimple })`, e.g. cliproxyapi's "cliproxyapi-codex-responses") has no
- * entry there, so compat throws `No API provider registered for api: ...`.
- * ctx.modelRegistry.complete() resolves auth and routes through the provider pi
- * composed, so extension-provided api ids behave like builtin ones.
+ * Fallback rules:
+ * - Advances to the next configured candidate only on missing model, auth or
+ *   provider throw, `stopReason === "error"`, or per-candidate 30s timeout.
+ * - External cancellation immediately stops the chain without touching later
+ *   candidates.
+ * - Any valid model response (`stopReason !== "error" && stopReason !== "aborted"`),
+ *   even if empty or sanitized to null, stops immediately to avoid duplicate billing.
+ * - When an explicit model override is configured, never falls back to ctx.model.
  */
 
-import type { Api, Model, UserMessage } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Context, Model, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { RenameConfig } from "./config.ts";
+import { formatModelRef, getConfiguredModels, type RenameConfig } from "./config.ts";
 
 export type NamingKind = "first" | "history" | "update";
 
 export const MAX_TITLE_LENGTH = 80;
-export const NAMING_MAX_TOKENS = 64;
+export const NAMING_MAX_TOKENS = 128;
 export const NAMING_TIMEOUT_MS = 30 * 1000;
 
 export interface NamingOptions {
@@ -49,15 +53,15 @@ export interface NamingResult {
 	reason?: "timeout" | "cancelled";
 }
 
-/** Resolve the model to use for naming. */
+/** Resolve the primary model to use for naming (preserved for compatibility). */
 export function resolveModel(ctx: ExtensionContext, config: RenameConfig): { model?: Model<Api>; error?: string } {
-	const override = config.model;
-	if (override) {
-		const model = ctx.modelRegistry.find(override.provider, override.id);
-		if (!model) {
-			return { error: `Rename model not found: ${override.provider}/${override.id}` };
+	const overrides = getConfiguredModels(config);
+	if (overrides.length > 0) {
+		for (const ref of overrides) {
+			const model = ctx.modelRegistry.find(ref.provider, ref.id);
+			if (model) return { model };
 		}
-		return { model };
+		return { error: `Rename model not found: ${overrides.map(formatModelRef).join(", ")}` };
 	}
 	if (!ctx.model) {
 		return { error: "No active session model available for naming" };
@@ -147,8 +151,125 @@ export function sanitizeName(raw: string): string | null {
 	return name.length > 0 ? name : null;
 }
 
+type AttemptOutcome =
+	| { kind: "response"; response: AssistantMessage }
+	| { kind: "cancelled" }
+	| { kind: "failed"; error: string; reason?: "timeout" };
+
+async function callNamingProvider(
+	ctx: ExtensionContext,
+	model: Model<Api>,
+	context: Context,
+	signal: AbortSignal,
+): Promise<AssistantMessage> {
+	const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
+		streamSimple?: ExtensionContext["modelRegistry"]["streamSimple"];
+	};
+	if (typeof registry.streamSimple === "function") {
+		return await registry
+			.streamSimple(model, context, {
+				maxTokens: NAMING_MAX_TOKENS,
+				signal,
+				...(model.reasoning ? { reasoning: "minimal" as const } : {}),
+			})
+			.result();
+	}
+	return await registry.complete(model, context, {
+		maxTokens: NAMING_MAX_TOKENS,
+		signal,
+	});
+}
+
+async function runSingleAttempt(
+	ctx: ExtensionContext,
+	model: Model<Api>,
+	context: Context,
+	externalSignal?: AbortSignal,
+): Promise<AttemptOutcome> {
+	// Every attempt owns a request-specific controller and an independent 30s
+	// deadline, whether or not an upstream signal exists: a provider that ignores
+	// abort must not be able to keep the extension's request pending forever.
+	// The controller is only used to cancel this title request — never ctx.abort()
+	// or the primary agent's controller.
+	const controller = new AbortController();
+	let timedOut = false;
+	const cleanups: Array<() => void> = [];
+
+	const localFailure = (): AttemptOutcome =>
+		timedOut
+			? { kind: "failed", error: `Naming request timed out after ${NAMING_TIMEOUT_MS}ms`, reason: "timeout" }
+			: { kind: "cancelled" };
+
+	try {
+		const timeout = setTimeout(() => {
+			timedOut = true;
+			controller.abort();
+		}, NAMING_TIMEOUT_MS);
+		cleanups.push(() => clearTimeout(timeout));
+
+		const onExternalAbort = (): void => {
+			controller.abort();
+		};
+		if (externalSignal) {
+			if (externalSignal.aborted) {
+				return { kind: "cancelled" };
+			}
+			externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+			cleanups.push(() => externalSignal.removeEventListener("abort", onExternalAbort));
+		}
+
+		if (controller.signal.aborted) return localFailure();
+
+		// Registered before the provider call so the local deadline/cancellation
+		// outcome wins the race even when the provider also reacts to the abort.
+		let resolveLocal: (outcome: AttemptOutcome) => void = () => {};
+		const localCancellation = new Promise<AttemptOutcome>((resolve) => {
+			resolveLocal = resolve;
+		});
+		const onLocalAbort = (): void => {
+			resolveLocal(localFailure());
+		};
+		controller.signal.addEventListener("abort", onLocalAbort, { once: true });
+		cleanups.push(() => controller.signal.removeEventListener("abort", onLocalAbort));
+
+		// The provider work always settles (never rejects): a late rejection after
+		// cancellation is consumed here and ignored.
+		const providerWork = (async (): Promise<AttemptOutcome> => {
+			try {
+				const response = await callNamingProvider(ctx, model, context, controller.signal);
+				if (externalSignal?.aborted) return { kind: "cancelled" };
+				if (response.stopReason === "error" || response.stopReason === "aborted") {
+					if (response.stopReason === "aborted" && timedOut) {
+						return { kind: "failed", error: `Naming request timed out after ${NAMING_TIMEOUT_MS}ms`, reason: "timeout" };
+					}
+					return { kind: "failed", error: response.errorMessage ?? `Naming request failed (${response.stopReason})` };
+				}
+				return { kind: "response", response };
+			} catch (error) {
+				if (externalSignal?.aborted) return { kind: "cancelled" };
+				if (timedOut) {
+					return { kind: "failed", error: `Naming request timed out after ${NAMING_TIMEOUT_MS}ms`, reason: "timeout" };
+				}
+				return { kind: "failed", error: error instanceof Error ? error.message : String(error) };
+			}
+		})();
+
+		return await Promise.race([providerWork, localCancellation]);
+	} catch (error) {
+		return { kind: "failed", error: error instanceof Error ? error.message : String(error) };
+	} finally {
+		for (const cleanup of cleanups.splice(0)) {
+			try {
+				cleanup();
+			} catch {
+				// Cleanup must stay total.
+			}
+		}
+	}
+}
+
 /**
- * Generate a title for the given input using the resolved naming model.
+ * Generate a title for the given input using the resolved naming model chain.
  * Returns { name } on success or { error } on any failure — never throws.
  */
 export async function generateName(
@@ -158,27 +279,7 @@ export async function generateName(
 	input: string,
 	options?: NamingOptions,
 ): Promise<NamingResult> {
-	// Every request owns a request-specific controller and an independent 30s
-	// deadline, whether or not an upstream signal exists: a provider that ignores
-	// abort must not be able to keep the extension's request pending forever.
-	// The controller is only used to cancel this title request — never ctx.abort()
-	// or the primary agent's controller.
-	const controller = new AbortController();
-	let timedOut = false;
-	const cleanups: Array<() => void> = [];
-
-	const localOutcome = (): NamingResult =>
-		timedOut
-			? { error: `Naming request timed out after ${NAMING_TIMEOUT_MS}ms`, reason: "timeout" }
-			: { error: "Naming request cancelled", reason: "cancelled" };
-
 	try {
-		const timeout = setTimeout(() => {
-			timedOut = true;
-			controller.abort();
-		}, NAMING_TIMEOUT_MS);
-		cleanups.push(() => clearTimeout(timeout));
-
 		// ctx.signal is a context getter that can throw once the context has been
 		// invalidated; capture it defensively so generateName keeps its
 		// "never throws" contract (an explicit options.signal is always safe).
@@ -189,87 +290,73 @@ export async function generateName(
 			externalSignal = options?.signal;
 		}
 
-		const onExternalAbort = (): void => {
-			controller.abort();
-		};
-		if (externalSignal) {
-			if (externalSignal.aborted) {
-				onExternalAbort();
-			} else {
-				const signal = externalSignal;
-				signal.addEventListener("abort", onExternalAbort, { once: true });
-				cleanups.push(() => signal.removeEventListener("abort", onExternalAbort));
-			}
+		if (externalSignal?.aborted) {
+			return { error: "Naming request cancelled", reason: "cancelled" };
 		}
 
-		// Pre-aborted upstream signal: settle locally without dispatching.
-		if (controller.signal.aborted) return localOutcome();
-
-		// Registered before the provider call so the local deadline/cancellation
-		// outcome wins the race even when the provider also reacts to the abort.
-		// The listener is named and removed in finally: we never assume the
-		// provider drops its retained AbortSignal reference.
-		let resolveLocal: (result: NamingResult) => void = () => {};
-		const localCancellation = new Promise<NamingResult>((resolve) => {
-			resolveLocal = resolve;
-		});
-		const onLocalAbort = (): void => {
-			resolveLocal(localOutcome());
-		};
-		controller.signal.addEventListener("abort", onLocalAbort, { once: true });
-		cleanups.push(() => controller.signal.removeEventListener("abort", onLocalAbort));
-
-		// The provider work always settles (never rejects): a late rejection after
-		// cancellation is consumed here and ignored.
-		const providerWork = (async (): Promise<NamingResult> => {
-			try {
-				const resolved = resolveModel(ctx, config);
-				if (!resolved.model) return { error: resolved.error ?? "No naming model available" };
-
-				const systemPrompt = buildSystemPrompt(config);
-				const userMessage = buildUserPrompt(kind, input, options?.currentName);
-
-				// Registry call: resolves apiKey/headers/baseUrl, then streams through the
-				// effective provider (including extension-registered api ids). Auth and
-				// provider failures throw here and become { error } below.
-				const response = await ctx.modelRegistry.complete(
-					resolved.model,
-					{ systemPrompt, messages: [userMessage] },
-					{ maxTokens: NAMING_MAX_TOKENS, signal: controller.signal },
+		const overrides = getConfiguredModels(config);
+		const candidates: Array<{ label: string; model?: Model<Api>; missingError?: string }> = [];
+		if (overrides.length > 0) {
+			for (const ref of overrides) {
+				const label = formatModelRef(ref);
+				const found = ctx.modelRegistry.find(ref.provider, ref.id);
+				candidates.push(
+					found
+						? { label, model: found }
+						: { label, missingError: `Rename model not found: ${label}` },
 				);
-
-				if (response.stopReason === "error" || response.stopReason === "aborted") {
-					return { error: response.errorMessage ?? `Naming request failed (${response.stopReason})` };
-				}
-
-				const raw = response.content
-					.filter((block): block is { type: "text"; text: string } => block.type === "text")
-					.map((block) => block.text)
-					.join("\n");
-
-				const name = sanitizeName(raw);
-				if (!name) {
-					return { error: "Naming model returned an empty title" };
-				}
-				return { name };
-			} catch (error) {
-				return { error: error instanceof Error ? error.message : String(error) };
 			}
-		})();
+		} else if (ctx.model) {
+			candidates.push({ label: `${ctx.model.provider}/${ctx.model.id}`, model: ctx.model });
+		} else {
+			return { error: "No active session model available for naming" };
+		}
 
-		return await Promise.race([providerWork, localCancellation]);
+		const systemPrompt = buildSystemPrompt(config);
+		const userMessage = buildUserPrompt(kind, input, options?.currentName);
+		const context: Context = { systemPrompt, messages: [userMessage] };
+
+		const failures: Array<{ label: string; error: string; reason?: "timeout" }> = [];
+		for (const candidate of candidates) {
+			if (externalSignal?.aborted) {
+				return { error: "Naming request cancelled", reason: "cancelled" };
+			}
+			if (!candidate.model) {
+				failures.push({ label: candidate.label, error: candidate.missingError ?? `Rename model not found: ${candidate.label}` });
+				continue;
+			}
+			const attempt = await runSingleAttempt(ctx, candidate.model, context, externalSignal);
+			if (attempt.kind === "cancelled") {
+				return { error: "Naming request cancelled", reason: "cancelled" };
+			}
+			if (attempt.kind === "failed") {
+				failures.push({ label: candidate.label, error: attempt.error, ...(attempt.reason ? { reason: attempt.reason } : {}) });
+				continue;
+			}
+
+			// Valid response received: stop immediately even if empty/unusable so we never double-bill.
+			const raw = attempt.response.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+
+			const name = sanitizeName(raw);
+			if (!name) {
+				return { error: "Naming model returned an empty title" };
+			}
+			return { name };
+		}
+
+		if (failures.length === 1) {
+			const only = failures[0]!;
+			return { error: only.error, ...(only.reason ? { reason: only.reason } : {}) };
+		}
+		const allTimeout = failures.length > 0 && failures.every((failure) => failure.reason === "timeout");
+		return {
+			error: failures.map((failure) => `${failure.label}: ${failure.error}`).join("; "),
+			...(allTimeout ? { reason: "timeout" as const } : {}),
+		};
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };
-	} finally {
-		// Timer and every listener this request owns are removed on all exit
-		// paths: success, provider/auth failure, deadline, cancellation, and
-		// pre-aborted input.
-		for (const cleanup of cleanups.splice(0)) {
-			try {
-				cleanup();
-			} catch {
-				// Cleanup must stay total.
-			}
-		}
 	}
 }

@@ -23,9 +23,12 @@ behavior is configurable and predictable, and it never overwrites a name you set
 - **Manual names are never overwritten** — `/name`, `/rename <name>`, and `/rename` (AI)
   all mark the session as manual. The flag is persisted in the session, so it survives
   restart and `/resume`. External renames are detected and protected too.
-- **Model follows your session** — naming uses your current session model by default, no
-  configuration needed. Override it per-session-globally with `/rename-config model`.
-- **Graceful degradation** — if the naming model is unavailable or has no API key, auto
+- **Model follows your session, or an ordered fallback chain** — naming uses your current session model by default, no
+  configuration needed. Override it globally with `/rename-config model` (single model or an ordered fallback chain);
+  missing models, auth/provider errors, and 30s timeouts automatically advance to the next candidate. When an explicit
+  override is configured, it never falls back to the session model; once a candidate returns a valid response (even if
+  empty), later candidates are never retried to avoid duplicate billing, and cancellation stops immediately.
+- **Graceful degradation** — if all naming models are unavailable or have no API key, auto
   naming skips silently with a warning notification; `/rename` reports a clear error.
 - **Quiet outside the terminal** — "Session named/renamed" and automatic-naming warnings
   are shown only in the TUI. RPC clients such as pi-web (which turn every notification into
@@ -34,8 +37,9 @@ behavior is configurable and predictable, and it never overwrites a name you set
 
 ## Requirements
 
-- pi ≥ 0.84 with `ctx.modelRegistry.complete()` (pi's `ModelRegistry.complete`).
-  Naming calls go through the model registry, so models served by provider
+- pi ≥ 0.84 with `ctx.modelRegistry.streamSimple()` (falling back to `complete()` on older/mock registries).
+  Naming requests use `maxTokens: 128` and pass `reasoning: "minimal"` for reasoning models so thinking cannot exhaust
+  the title budget. Calls go through the model registry, so models served by provider
   extensions — including ones with custom api ids such as cliproxyapi's
   `cliproxyapi-codex-responses` — work like builtin providers.
 - Automatic title requests are off the agent's execution path: each has its own
@@ -70,8 +74,8 @@ Then run `/reload` inside pi (or restart pi).
 | `/rename` | Generate a new title from the full conversation history (≤8000 chars) and set it. Marks the session as **manual**. |
 | `/rename <name>` | Set the session name directly. Marks the session as **manual**. |
 | `/rename-config` | Interactive wizard: model / style / auto / continuous / language / show / reset / done (TUI). Loops back to the menu after each change; `esc` exits. Falls back to showing the config in UI-less modes. |
-| `/rename-config model` | Interactive model picker (when a TUI is available). |
-| `/rename-config model provider/id` | Use a specific model for naming. |
+| `/rename-config model` | Interactive model-chain submenu (view full list, set primary, add fallback, remove, clear) when a TUI is available. |
+| `/rename-config model provider/id[,provider2/id2]` | Use a single model or ordered fallback chain for naming (deduplicated). |
 | `/rename-config model none` | Clear the override; naming follows the session model again. |
 | `/rename-config style concise\|formal\|playful\|custom [desc]` | Set the naming style. `custom` requires a description. |
 | `/rename-config auto on\|off` | Master switch for automatic naming (default `on`). |
@@ -95,7 +99,7 @@ Persisted to `<agentDir>/pi-auto-rename.json` (`~/.pi/agent/pi-auto-rename.json`
 
 | Field | Default | Meaning |
 |---|---|---|
-| `model` | *(absent)* | `{ provider, id }` naming-model override; absent = follow session model. |
+| `model` | *(absent)* | `{ provider, id }`, `"provider/id"`, or an ordered array of them for fallback; absent = follow session model. |
 | `style` | `concise` | `concise` \| `formal` \| `playful` \| `custom` |
 | `customStyle` | *(absent)* | Free-form style description when `style` is `custom`. |
 | `autoRename` | `true` | Master switch for automatic naming. |
@@ -145,7 +149,7 @@ warning, so the extension always stays usable.
 index.ts     # Entry: event bindings, state machine, commands
 config.ts    # Global config type, defaults, read/write
 state.ts     # Per-session state persistence (pi.appendEntry)
-naming.ts    # Model resolution, prompt building, modelRegistry.complete() call, title sanitizing
+naming.ts    # Model chain resolution, prompt building, streamSimple/complete call, title sanitizing
 ui-config.ts # Interactive /rename-config wizard (TUI pickers, searchable model list)
 ```
 

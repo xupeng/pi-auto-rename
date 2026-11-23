@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> **This repository has been archived and moved.**
+>
+> Development has moved to [`xupeng/pi-extensions`](https://github.com/xupeng/pi-extensions) under [`pi-auto-rename/`](https://github.com/xupeng/pi-extensions/tree/main/pi-auto-rename) (private monorepo with full Git history preserved). This standalone repository is now read-only.
+
 # pi-auto-rename
 
 Modern automatic session renaming for [pi](https://github.com/earendil-works/pi). After the
